@@ -3,16 +3,31 @@ import { api } from "../api.js";
 import { rupees } from "../format.js";
 import SymbolSearch from "./SymbolSearch.jsx";
 
-// The buy/sell form. It carries the trade journal fields (reason, confidence,
-// tags) because capturing WHY is the whole point of this project — not just
-// quantity/price.
+// The trade form. Four actions, two directions:
+//   long  side:  BUY   (open)  ->  SELL  (close)
+//   short side:  SHORT (open)  ->  COVER (close)
+//
+// OPENING trades (buy/short) capture the journal fields — reason, confidence,
+// tags — because capturing WHY is the whole point of this project. CLOSING
+// trades (sell/cover) only need a reason, since confidence/tags are inherited
+// from the opening trade they close via FIFO matching on the backend.
 //
 // State placement: every input here is local component state. The parent passes
-// down what the form needs to VALIDATE against (cash for buys, holdings for
-// sells) but the parent does NOT own the keystrokes. On a successful trade the
-// form calls onDone() so the parent refetches the (now changed) strategy.
+// down what the form needs to VALIDATE against (cash, holdings) but does NOT
+// own the keystrokes. On a successful trade the form calls onDone() so the
+// parent refetches the (now changed) strategy.
+
+// One table drives labels, validation and the API call — adding a mode means
+// adding a row here, not scattering `if (side === ...)` through the component.
+const ACTIONS = {
+  buy:   { label: "Buy",   verb: "Bought",  opening: true,  cls: "primary", api: "buy" },
+  sell:  { label: "Sell",  verb: "Sold",    opening: false, cls: "danger",  api: "sell" },
+  short: { label: "Short", verb: "Shorted", opening: true,  cls: "danger",  api: "short" },
+  cover: { label: "Cover", verb: "Covered", opening: false, cls: "primary", api: "cover" },
+};
+
 export default function TradeForm({ name, cash, holdings, onDone }) {
-  const [side, setSide] = useState("buy"); // "buy" | "sell"
+  const [side, setSide] = useState("buy");
   const [symbol, setSymbol] = useState("");
   const [quantity, setQuantity] = useState("");
   const [price, setPrice] = useState("");
@@ -25,6 +40,8 @@ export default function TradeForm({ name, cash, holdings, onDone }) {
   const [ok, setOk] = useState(null);
   const [fetchingQuote, setFetchingQuote] = useState(false);
   const [quoteNote, setQuoteNote] = useState(null);
+
+  const action = ACTIONS[side];
 
   // Groww-style market prefill: picking a symbol (or clicking "live") fetches
   // the current quote and fills the price field. The field stays editable — you
@@ -48,8 +65,12 @@ export default function TradeForm({ name, cash, holdings, onDone }) {
   const px = Number(price);
   const cost = qty > 0 && px > 0 ? qty * px : 0;
 
-  // How many shares of this symbol we currently hold (for sell validation).
-  const held = holdings?.find((h) => h.symbol === symbol.trim().toUpperCase())?.quantity ?? 0;
+  // The existing position in this symbol, if any. quantity is signed: positive
+  // for a long, negative for a short (matching the engine).
+  const pos = holdings?.find((h) => h.symbol === symbol.trim().toUpperCase());
+  const posQty = pos?.quantity ?? 0;
+  const heldLong = posQty > 0 ? posQty : 0;
+  const heldShort = posQty < 0 ? -posQty : 0;
 
   // --- client-side validation (mirrors the server's rules for instant feedback).
   // The server re-validates too — this is UX, not security.
@@ -57,9 +78,24 @@ export default function TradeForm({ name, cash, holdings, onDone }) {
   if (!symbol.trim()) errors.push("symbol required");
   if (!Number.isInteger(qty) || qty <= 0) errors.push("quantity must be a whole number > 0");
   if (!(px > 0)) errors.push("price must be > 0");
-  if (!reason.trim()) errors.push(side === "buy" ? "reason / thesis required" : "reason for selling required");
-  if (side === "buy" && cost > cash) errors.push(`not enough cash: need ${rupees(cost)}, have ${rupees(cash)}`);
-  if (side === "sell" && qty > held) errors.push(`only ${held} shares held`);
+  if (!reason.trim()) {
+    errors.push(action.opening ? "reason / thesis required" : `reason for ${side}ing required`);
+  }
+  if (side === "buy") {
+    if (cost > cash) errors.push(`not enough cash: need ${rupees(cost)}, have ${rupees(cash)}`);
+    if (heldShort) errors.push(`you're short ${heldShort} ${symbol} — use Cover to close it`);
+  }
+  if (side === "sell") {
+    if (heldShort) errors.push(`you're short ${heldShort} ${symbol} — use Cover, not Sell`);
+    else if (qty > heldLong) errors.push(`only ${heldLong} shares held`);
+  }
+  if (side === "short" && heldLong) {
+    errors.push(`you hold ${heldLong} ${symbol} long — sell that first`);
+  }
+  if (side === "cover") {
+    if (heldLong) errors.push(`you hold ${symbol} long — use Sell, not Cover`);
+    else if (qty > heldShort) errors.push(`only ${heldShort} shares shorted`);
+  }
   const valid = errors.length === 0;
 
   function reset() {
@@ -74,17 +110,17 @@ export default function TradeForm({ name, cash, holdings, onDone }) {
     setOk(null);
     try {
       const sym = symbol.trim().toUpperCase();
-      if (side === "buy") {
-        const tagList = tags.split(",").map((t) => t.trim()).filter(Boolean);
-        const res = await api.buy(name, {
-          symbol: sym, quantity: qty, price: px, reason: reason.trim(),
-          confidence: Number(confidence), tags: tagList,
-        });
-        setOk(`Bought ${qty} ${sym}. Cash left ${rupees(res.cash)}.`);
-      } else {
-        const res = await api.sell(name, { symbol: sym, quantity: qty, price: px, reason: reason.trim() });
-        setOk(`Sold ${qty} ${sym}. Realized ${rupees(res.realized_pnl)}.`);
+      const payload = { symbol: sym, quantity: qty, price: px, reason: reason.trim() };
+      if (action.opening) {
+        payload.confidence = Number(confidence);
+        payload.tags = tags.split(",").map((t) => t.trim()).filter(Boolean);
       }
+      const res = await api[action.api](name, payload);
+      setOk(
+        action.opening
+          ? `${action.verb} ${qty} ${sym}. Cash now ${rupees(res.cash)}.`
+          : `${action.verb} ${qty} ${sym}. Realized ${rupees(res.realized_pnl)}.`
+      );
       reset();
       onDone?.();
     } catch (err) {
@@ -97,9 +133,24 @@ export default function TradeForm({ name, cash, holdings, onDone }) {
   return (
     <form className="card trade-form" onSubmit={submit}>
       <div className="seg">
-        <button type="button" className={side === "buy" ? "on" : ""} onClick={() => setSide("buy")}>Buy</button>
-        <button type="button" className={side === "sell" ? "on" : ""} onClick={() => setSide("sell")}>Sell</button>
+        {Object.entries(ACTIONS).map(([key, a]) => (
+          <button
+            key={key}
+            type="button"
+            className={side === key ? "on" : ""}
+            onClick={() => { setSide(key); setError(null); setOk(null); }}
+          >
+            {a.label}
+          </button>
+        ))}
       </div>
+
+      {side === "short" && (
+        <p className="muted" style={{ fontSize: 12, margin: "0 0 8px" }}>
+          Selling borrowed shares — you profit if the price <strong>falls</strong>.
+          No borrow fee or same-day square-off is modeled.
+        </p>
+      )}
 
       <div className="row">
         <label>Symbol
@@ -131,22 +182,31 @@ export default function TradeForm({ name, cash, holdings, onDone }) {
         </label>
       </div>
 
-      <label>Reason {side === "buy" ? "/ thesis" : "for selling"}
+      <label>Reason {action.opening ? "/ thesis" : `for ${side}ing`}
         <textarea
           rows={2}
           value={reason}
           onChange={(e) => setReason(e.target.value)}
-          placeholder={side === "buy" ? "Why this trade? What's the thesis?" : "Target hit? Stop loss? Thesis changed? Panic?"}
+          placeholder={
+            action.opening
+              ? "Why this trade? What's the thesis?"
+              : "Target hit? Stop loss? Thesis changed? Panic?"
+          }
         />
       </label>
 
-      {side === "buy" && (
+      {/* Journal fields only on OPENING trades — closes inherit them via FIFO. */}
+      {action.opening && (
         <div className="row">
           <label>Confidence: <strong>{confidence}</strong>/5
             <input type="range" min="1" max="5" value={confidence} onChange={(e) => setConfidence(e.target.value)} />
           </label>
           <label>Tags (comma-separated)
-            <input value={tags} onChange={(e) => setTags(e.target.value)} placeholder="earnings play, breakout" />
+            <input
+              value={tags}
+              onChange={(e) => setTags(e.target.value)}
+              placeholder={side === "short" ? "mean reversion, gap fade" : "earnings play, breakout"}
+            />
           </label>
         </div>
       )}
@@ -154,7 +214,9 @@ export default function TradeForm({ name, cash, holdings, onDone }) {
       <div className="trade-meta">
         <span>Order value: <strong>{rupees(cost)}</strong></span>
         {side === "buy" && <span className="muted"> · cash after: {rupees(cash - cost)}</span>}
-        {side === "sell" && symbol.trim() && <span className="muted"> · held: {held}</span>}
+        {side === "short" && <span className="muted"> · proceeds credited: {rupees(cost)}</span>}
+        {side === "sell" && symbol.trim() && <span className="muted"> · held: {heldLong}</span>}
+        {side === "cover" && symbol.trim() && <span className="muted"> · shorted: {heldShort}</span>}
       </div>
 
       {/* live validation feedback before submit */}
@@ -164,8 +226,8 @@ export default function TradeForm({ name, cash, holdings, onDone }) {
       {error && <div className="inline-error"><strong>{error.type}:</strong> {error.message}</div>}
       {ok && <div className="inline-ok">{ok}</div>}
 
-      <button className={side === "buy" ? "primary" : "danger"} disabled={!valid || submitting}>
-        {submitting ? "Submitting…" : side === "buy" ? "Buy" : "Sell"}
+      <button className={action.cls} disabled={!valid || submitting}>
+        {submitting ? "Submitting…" : action.label}
       </button>
     </form>
   );

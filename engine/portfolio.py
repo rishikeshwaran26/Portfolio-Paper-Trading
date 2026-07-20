@@ -15,7 +15,9 @@ from typing import Optional
 from .errors import InsufficientFunds, InsufficientHoldings, InvalidTrade
 from .models import (
     BUY,
+    COVER,
     SELL,
+    SHORT,
     ClosedLot,
     Holding,
     Transaction,
@@ -79,6 +81,14 @@ class Portfolio:
             raise InvalidTrade(f"confidence must be {MIN_CONFIDENCE}-{MAX_CONFIDENCE}, got {confidence}")
         if not reason or not reason.strip():
             raise InvalidTrade("a buy needs a reason (your thesis for the journal)")
+        existing = self.holdings.get(symbol)
+        if existing and existing.is_short:
+            # Averaging a "buy" into a short's negative quantity would silently
+            # net the position instead of properly realizing short P&L via FIFO.
+            # Keep the two flows unambiguous: closing a short is always cover().
+            raise InvalidTrade(
+                f"you have an open short position in {symbol} — use cover() to close it, not buy()"
+            )
 
         cost = _round2(quantity * price)
         if cost > self.cash + 1e-6:  # tiny epsilon so exact-cash buys pass despite float dust
@@ -141,6 +151,10 @@ class Portfolio:
             raise InvalidTrade("a sell needs a reason (target hit? stop loss? thesis changed?)")
 
         holding = self.holdings.get(symbol)
+        if holding and holding.is_short:
+            raise InvalidTrade(
+                f"you have a short position in {symbol} — use cover() to close it, not sell()"
+            )
         if not holding or holding.quantity < quantity:
             have = holding.quantity if holding else 0
             raise InsufficientHoldings(
@@ -151,7 +165,7 @@ class Portfolio:
         realized = _round2((price - holding.avg_price) * quantity)
 
         # (2) FIFO-match this sell against open buys for journal attribution.
-        closed_lots = self._match_fifo(symbol, quantity, price)
+        closed_lots = self._match_fifo(symbol, quantity, price, opening_type=BUY)
 
         # Reduce the position. avg_price stays the same — selling doesn't change
         # the cost basis of the shares you still own.
@@ -175,32 +189,166 @@ class Portfolio:
         self.transactions.append(txn)
         return txn
 
-    def _match_fifo(self, symbol: str, quantity: int, sell_price: float) -> list[ClosedLot]:
-        """Draw down open buy lots oldest-first, recording which buys (and their
-        confidence/tags) this sale closed. Mutates each buy's open_quantity."""
+    def _match_fifo(
+        self, symbol: str, quantity: int, exit_price: float, opening_type: str
+    ) -> list[ClosedLot]:
+        """Draw down open BUY (or SHORT) lots oldest-first, recording which
+        opening trade (and its confidence/tags) this exit closed. Mutates each
+        opening trade's open_quantity.
+
+        `opening_type` is BUY when called from sell(), SHORT when called from
+        cover() — same FIFO mechanics, just matched against the other side's
+        opening trades. lot_pnl direction flips accordingly: a sell profits
+        when exit_price > entry price; a cover profits when exit_price is
+        LOWER than the short's entry price, so the sign is inverted for SHORT.
+        """
         remaining = quantity
         lots: list[ClosedLot] = []
-        for buy in self.transactions:
+        for opening in self.transactions:
             if remaining <= 0:
                 break
-            if buy.type != BUY or buy.symbol != symbol or buy.open_quantity <= 0:
+            if opening.type != opening_type or opening.symbol != symbol or opening.open_quantity <= 0:
                 continue
-            take = min(buy.open_quantity, remaining)
-            buy.open_quantity -= take
+            take = min(opening.open_quantity, remaining)
+            opening.open_quantity -= take
             remaining -= take
+            if opening_type == BUY:
+                lot_pnl = (exit_price - opening.price) * take
+            else:  # SHORT: profit when you buy back BELOW the price you shorted at
+                lot_pnl = (opening.price - exit_price) * take
             lots.append(
                 ClosedLot(
-                    buy_id=buy.id,
+                    buy_id=opening.id,
                     quantity=take,
-                    buy_price=buy.price,
-                    sell_price=_round2(sell_price),
-                    confidence=buy.confidence,
-                    tags=list(buy.tags),
-                    holding_days=_holding_days(buy.timestamp),
-                    lot_pnl=_round2((sell_price - buy.price) * take),
+                    buy_price=opening.price,
+                    sell_price=_round2(exit_price),
+                    confidence=opening.confidence,
+                    tags=list(opening.tags),
+                    holding_days=_holding_days(opening.timestamp),
+                    lot_pnl=_round2(lot_pnl),
                 )
             )
         return lots
+
+    # -- short selling ----------------------------------------------------------
+    def short(
+        self,
+        symbol: str,
+        quantity: int,
+        price: float,
+        reason: str,
+        confidence: int,
+        tags: Optional[list[str]] = None,
+    ) -> Transaction:
+        """Sell-to-open `quantity` borrowed shares of `symbol` at `price`,
+        betting the price falls. Mirrors buy(): same validation, same
+        confidence/tags thesis-capture, same weighted-average-on-repeat
+        behavior — just building a NEGATIVE holding instead of a positive one.
+
+        You receive the sale proceeds immediately (cash increases), because in
+        a real market that's what selling borrowed shares does. The offsetting
+        obligation to buy them back shows up as a negative market_value, so
+        total_value (cash + holdings_value) is unchanged at the moment you
+        open the short — it only moves as the price moves, exactly like a buy.
+
+        Known simplification: no borrow fee / margin interest is modeled, and
+        a short can be held indefinitely (real intraday shorting must be
+        squared off same-day; that rule isn't enforced here).
+        """
+        symbol = _normalize_symbol(symbol)
+        _require_positive_int("quantity", quantity)
+        _require_positive_number("price", price)
+        if not (MIN_CONFIDENCE <= confidence <= MAX_CONFIDENCE):
+            raise InvalidTrade(f"confidence must be {MIN_CONFIDENCE}-{MAX_CONFIDENCE}, got {confidence}")
+        if not reason or not reason.strip():
+            raise InvalidTrade("a short needs a reason (your thesis for the journal)")
+        existing = self.holdings.get(symbol)
+        if existing and not existing.is_short:
+            raise InvalidTrade(
+                f"you already hold {existing.quantity} {symbol} long — sell that position first"
+            )
+
+        if existing:
+            # Weighted-average short entry price, same formula as buy() but
+            # over the magnitude of the (negative) existing quantity.
+            total_qty = abs(existing.quantity) + quantity
+            total_cost = abs(existing.quantity) * existing.avg_price + quantity * price
+            existing.quantity -= quantity  # more negative = bigger short
+            existing.avg_price = _round2(total_cost / total_qty)
+        else:
+            self.holdings[symbol] = Holding(symbol=symbol, quantity=-quantity, avg_price=_round2(price))
+
+        self.cash = _round2(self.cash + quantity * price)  # proceeds received now
+
+        txn = Transaction(
+            id=new_id(),
+            type=SHORT,
+            symbol=symbol,
+            quantity=quantity,
+            price=_round2(price),
+            timestamp=_now_iso(),
+            reason=reason.strip(),
+            confidence=confidence,
+            tags=[t.strip() for t in (tags or []) if t.strip()],
+            open_quantity=quantity,  # all of this short is still open, for FIFO linking
+        )
+        self.transactions.append(txn)
+        return txn
+
+    def cover(self, symbol: str, quantity: int, price: float, reason: str) -> Transaction:
+        """Buy-to-close `quantity` shares of an open short position at `price`.
+
+        Mirrors sell(): same two-P&L-numbers structure (headline realized_pnl
+        against the blended average short price; per-lot lot_pnl via FIFO
+        against each original SHORT's entry price for journal attribution),
+        just with the direction of profit inverted — a cover profits when
+        `price` is BELOW the average short entry price.
+        """
+        symbol = _normalize_symbol(symbol)
+        _require_positive_int("quantity", quantity)
+        _require_positive_number("price", price)
+        if not reason or not reason.strip():
+            raise InvalidTrade("a cover needs a reason (target hit? stop loss? thesis changed?)")
+
+        holding = self.holdings.get(symbol)
+        if holding and not holding.is_short:
+            raise InvalidTrade(
+                f"you hold {symbol} long, not short — use sell() to close it, not cover()"
+            )
+        if not holding or abs(holding.quantity) < quantity:
+            have = abs(holding.quantity) if holding else 0
+            raise InsufficientHoldings(
+                f"cannot cover {quantity} {symbol}: only {have} shorted in '{self.name}'"
+            )
+
+        # (1) Headline realized P&L against the average short price — profit
+        # when you buy back below what you sold at.
+        realized = _round2((holding.avg_price - price) * quantity)
+
+        # (2) FIFO-match this cover against open SHORT lots for journal attribution.
+        closed_lots = self._match_fifo(symbol, quantity, price, opening_type=SHORT)
+
+        # Reduce the short (move toward zero). avg_price stays the same — it's
+        # the average price of the shares still owed, which hasn't changed.
+        holding.quantity += quantity
+        if holding.quantity == 0:
+            del self.holdings[symbol]
+
+        self.cash = _round2(self.cash - quantity * price)  # pay to buy back
+
+        txn = Transaction(
+            id=new_id(),
+            type=COVER,
+            symbol=symbol,
+            quantity=quantity,
+            price=_round2(price),
+            timestamp=_now_iso(),
+            reason=reason.strip(),
+            realized_pnl=realized,
+            closed_lots=closed_lots,
+        )
+        self.transactions.append(txn)
+        return txn
 
     # -- reviews --------------------------------------------------------------
     def review(self, transaction_id: str, outcome_notes: str) -> Transaction:
@@ -226,8 +374,11 @@ class Portfolio:
         return _round2(total)
 
     def realized_pnl(self) -> float:
-        """Sum of realized P&L across every sell so far (the booked profit)."""
-        return _round2(sum(t.realized_pnl or 0.0 for t in self.transactions if t.type == SELL))
+        """Sum of realized P&L across every closed trade so far — sells AND
+        covers both book realized profit, just via opposite-direction bets."""
+        return _round2(
+            sum(t.realized_pnl or 0.0 for t in self.transactions if t.type in (SELL, COVER))
+        )
 
     def holdings_value(self, prices: dict[str, float]) -> float:
         total = 0.0

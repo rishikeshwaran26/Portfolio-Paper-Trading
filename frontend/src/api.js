@@ -94,6 +94,10 @@ export const api = {
     request(`/strategies/${enc(name)}/buy`, { method: "POST", body: JSON.stringify(payload) }),
   sell: (name, payload) =>
     request(`/strategies/${enc(name)}/sell`, { method: "POST", body: JSON.stringify(payload) }),
+  short: (name, payload) =>
+    request(`/strategies/${enc(name)}/short`, { method: "POST", body: JSON.stringify(payload) }),
+  cover: (name, payload) =>
+    request(`/strategies/${enc(name)}/cover`, { method: "POST", body: JSON.stringify(payload) }),
 
   // journal
   transactions: (name) => request(`/strategies/${enc(name)}/transactions`),

@@ -23,6 +23,13 @@ from typing import Optional
 # --- Transaction types -------------------------------------------------------
 BUY = "BUY"
 SELL = "SELL"
+SHORT = "SHORT"   # sell borrowed shares to open a short position
+COVER = "COVER"   # buy back shares to close a short position
+
+# BUY and SHORT both *open* a position and carry a thesis (confidence/tags).
+# SELL and COVER both *close* one and realize P&L via FIFO-matched closed lots.
+OPENING_TYPES = (BUY, SHORT)
+CLOSING_TYPES = (SELL, COVER)
 
 
 def _now_iso() -> str:
@@ -80,17 +87,20 @@ class ClosedLot:
 
 @dataclass
 class Transaction:
-    """One buy or sell. This doubles as the trade-journal entry.
+    """One buy, sell, short, or cover. This doubles as the trade-journal entry.
 
-    Buy-only fields:  confidence, tags, open_quantity
-    Sell-only fields: realized_pnl, closed_lots
-    Shared:           reason (the journal thesis), review (added later)
+    Every trade is either OPENING a position (BUY or SHORT) or CLOSING one
+    (SELL or COVER) — see models.OPENING_TYPES / CLOSING_TYPES.
 
-    open_quantity (buys only): how many shares from THIS buy are still held.
-    It starts equal to quantity and is drawn down FIFO as sells happen. It is
-    what lets a later sell figure out which buys — and therefore which
-    confidence/tags — it is closing. Purely for journaling; the cash math does
-    not use it.
+    Opening-only fields (BUY, SHORT): confidence, tags, open_quantity
+    Closing-only fields (SELL, COVER): realized_pnl, closed_lots
+    Shared:                            reason (the journal thesis), review
+
+    open_quantity (opening trades only): how many shares from THIS buy/short
+    are still held/owed. It starts equal to quantity and is drawn down FIFO as
+    sells/covers happen. It is what lets a later close figure out which
+    opening trades — and therefore which confidence/tags — it is closing.
+    Purely for journaling; the cash math does not use it.
     """
 
     id: str
@@ -141,12 +151,25 @@ class Transaction:
 class Holding:
     """A current position in one symbol, average-cost style.
 
-    quantity  = shares held right now
-    avg_price = blended cost per share
+    quantity  = shares held right now. POSITIVE for a long position, NEGATIVE
+                for a short position (shares sold-to-open, owed back to the
+                lender). Zero-quantity holdings are never stored — Portfolio
+                deletes the entry once a position fully closes either way.
+    avg_price = blended entry price per share, ALWAYS POSITIVE regardless of
+                side — for a long it's the average buy price; for a short it's
+                the average price you sold at when opening it.
 
-    On repeated buys, avg_price is recalculated as a weighted average (see
-    Portfolio.buy). On sells, quantity drops but avg_price is UNCHANGED — the
-    cost basis of the shares you still hold hasn't moved.
+    On repeated buys (or repeated shorts), avg_price is recalculated as a
+    weighted average (see Portfolio.buy / Portfolio.short). On sells/covers,
+    quantity moves back toward zero but avg_price is UNCHANGED — the cost
+    basis of the shares you still hold (or still owe) hasn't moved.
+
+    Why signed quantity works for both sides without separate formulas: a
+    short's avg_price is the price you'll profit BELOW, and multiplying by a
+    negative quantity flips the sign of market_value/unrealized_pnl exactly
+    the way a short's economics require. E.g. shorted 10 @ ₹100
+    (quantity=-10, avg_price=100); price falls to ₹90:
+    unrealized_pnl = (90 - 100) * -10 = +₹100 — correctly a profit.
     """
 
     symbol: str
@@ -154,16 +177,22 @@ class Holding:
     avg_price: float
 
     @property
+    def is_short(self) -> bool:
+        return self.quantity < 0
+
+    @property
     def cost_basis(self) -> float:
-        """Total rupees currently tied up in this position."""
+        """Total rupees currently tied up in this position (negative for a
+        short, representing the buy-back liability rather than cash spent)."""
         return round(self.quantity * self.avg_price, 2)
 
     def market_value(self, current_price: float) -> float:
         return round(self.quantity * current_price, 2)
 
     def unrealized_pnl(self, current_price: float) -> float:
-        """Paper profit if you sold everything right now at current_price.
-        'Unrealized' because you haven't actually sold — it moves every tick."""
+        """Paper profit if you closed the whole position right now at
+        current_price. Works for both sides — see the class docstring for why
+        the signed quantity makes one formula correct for longs and shorts."""
         return round((current_price - self.avg_price) * self.quantity, 2)
 
     def to_dict(self) -> dict:

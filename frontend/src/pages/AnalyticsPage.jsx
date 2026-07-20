@@ -19,6 +19,7 @@ export default function AnalyticsPage() {
   const wl = data.winners_vs_losers;
   const byConf = data.by_confidence ?? [];
   const byTag = data.by_tag ?? [];
+  const bySide = data.by_side ?? { long: { closed_trades: 0 }, short: { closed_trades: 0 } };
 
   if (wl.closed_trades === 0) {
     return (
@@ -103,6 +104,43 @@ export default function AnalyticsPage() {
           )}
         </p>
       </section>
+
+      {/* --- long vs short: is the shorting actually working, on its own? --- */}
+      {(bySide.long.closed_trades > 0 || bySide.short.closed_trades > 0) && (
+        <section className="card">
+          <div className="card-title">Long vs short performance</div>
+          <p className="muted" style={{ marginTop: 0 }}>
+            Betting on a rise and betting on a fall are different skills — this
+            keeps them from hiding inside one blended number.
+          </p>
+          <table className="table">
+            <thead>
+              <tr>
+                <th></th><th className="num">Trades</th><th className="num">Win rate</th>
+                <th className="num">Total P&L</th><th className="num">Avg P&L</th><th className="num">Avg held (days)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span className="tag buy">LONG</span></td>
+                <td className="num">{bySide.long.closed_trades}</td>
+                <td className="num">{(bySide.long.win_rate * 100).toFixed(0)}%</td>
+                <td className={`num ${signClass(bySide.long.total_pnl)}`}>{pnl(bySide.long.total_pnl)}</td>
+                <td className={`num ${signClass(bySide.long.avg_pnl)}`}>{pnl(bySide.long.avg_pnl)}</td>
+                <td className="num">{bySide.long.avg_holding_days}</td>
+              </tr>
+              <tr>
+                <td><span className="tag short">SHORT</span></td>
+                <td className="num">{bySide.short.closed_trades}</td>
+                <td className="num">{(bySide.short.win_rate * 100).toFixed(0)}%</td>
+                <td className={`num ${signClass(bySide.short.total_pnl)}`}>{pnl(bySide.short.total_pnl)}</td>
+                <td className={`num ${signClass(bySide.short.avg_pnl)}`}>{pnl(bySide.short.avg_pnl)}</td>
+                <td className="num">{bySide.short.avg_holding_days}</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+      )}
 
       {/* --- by confidence --- */}
       <section className="card">

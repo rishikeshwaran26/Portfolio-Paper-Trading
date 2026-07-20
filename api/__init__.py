@@ -108,6 +108,8 @@ def create_app(
                     "GET    /strategies/<name>",
                     "POST   /strategies/<name>/buy",
                     "POST   /strategies/<name>/sell",
+                    "POST   /strategies/<name>/short",
+                    "POST   /strategies/<name>/cover",
                     "GET    /strategies/<name>/transactions",
                     "POST   /strategies/<name>/transactions/<id>/review",
                     "GET    /strategies/<name>/analytics",

@@ -7,8 +7,16 @@ your reasoning actually held up.
 
 All phases built: core engine → Flask REST API → React frontend → live NSE
 prices (with Yahoo fallback) + price charts → alerts, snapshots, comparison,
-analytics, auth → SQLite storage → **watchlist, symbol search, auto-updating
-quotes** (Groww-style).
+analytics, auth → SQLite storage → watchlist, symbol search, auto-updating
+quotes (Groww-style) → **short selling**.
+
+**Short selling:** four trade actions — BUY/SELL for long positions, and
+SHORT/COVER for short ones. A short is stored as a negative holding quantity,
+so one formula handles P&L for both sides (you profit when the price falls).
+Journal analytics break out long vs short performance separately, since
+betting on a rise and betting on a fall are different skills. Known
+simplifications: no borrow fee or margin interest is modeled, and intraday
+shorts are not force-squared-off at end of day.
 
 **About "real-time":** there is no free official real-time API for NSE.
 `nsepython` gives real-time quotes when NSE doesn't block your IP (home

@@ -35,6 +35,7 @@ from engine.alerts import ABOVE, BELOW
 from engine.prices import NsePythonPriceSource, market_is_open
 from engine.journal import (
     performance_by_confidence,
+    performance_by_side,
     performance_by_tag,
     winners_vs_losers,
 )
@@ -106,6 +107,9 @@ def _detail(p: Portfolio, prices: dict[str, float]) -> dict:
         holdings.append(
             {
                 "symbol": symbol,
+                "side": "short" if h.is_short else "long",
+                # quantity/avg_price stay signed/positive as the engine stores
+                # them; the frontend shows abs(quantity) with a side badge.
                 "quantity": h.quantity,
                 "avg_price": h.avg_price,
                 "last_price": ltp,
@@ -203,6 +207,50 @@ def sell(name: str):
     return resp
 
 
+@bp.post("/strategies/<name>/short")
+@require_auth
+def short(name: str):
+    # Same required fields as buy() — a short is still an opening trade with a
+    # thesis, just betting on a fall instead of a rise.
+    body = json_body()
+    symbol = req_str(body, "symbol")
+    quantity = req_int(body, "quantity")
+    price = req_num(body, "price")
+    reason = req_str(body, "reason")
+    confidence = req_int(body, "confidence")
+    tags = opt_tags(body)
+
+    manager = _manager()
+    p = _get_portfolio(manager, name)
+    txn = p.short(symbol, quantity, price, reason, confidence, tags)
+    manager.save()
+    _price_store().set_price(symbol, price)
+
+    resp = jsonify({"transaction": txn.to_dict(), "cash": p.cash})
+    resp.status_code = 201
+    return resp
+
+
+@bp.post("/strategies/<name>/cover")
+@require_auth
+def cover(name: str):
+    body = json_body()
+    symbol = req_str(body, "symbol")
+    quantity = req_int(body, "quantity")
+    price = req_num(body, "price")
+    reason = req_str(body, "reason")
+
+    manager = _manager()
+    p = _get_portfolio(manager, name)
+    txn = p.cover(symbol, quantity, price, reason)
+    manager.save()
+    _price_store().set_price(symbol, price)
+
+    resp = jsonify({"transaction": txn.to_dict(), "cash": p.cash, "realized_pnl": txn.realized_pnl})
+    resp.status_code = 201
+    return resp
+
+
 @bp.get("/strategies/<name>/transactions")
 @require_auth
 def transactions(name: str):
@@ -237,7 +285,9 @@ def review(name: str, txn_id: str):
 @require_auth
 def analytics(name: str):
     """Everything needed to answer 'what kind of trader am I?':
-    win rate + avg P&L by tag, by confidence, and winners vs losers."""
+    win rate + avg P&L by tag, by confidence, winners vs losers, and long vs
+    short performance side-by-side (a short strategy can be judged on its own
+    terms rather than blended into your long-side numbers)."""
     manager = _manager()
     p = _get_portfolio(manager, name)
     return jsonify(
@@ -245,6 +295,7 @@ def analytics(name: str):
             "by_confidence": [s.to_dict() for s in performance_by_confidence(p.transactions)],
             "by_tag": [s.to_dict() for s in performance_by_tag(p.transactions)],
             "winners_vs_losers": winners_vs_losers(p.transactions),
+            "by_side": performance_by_side(p.transactions),
         }
     )
 

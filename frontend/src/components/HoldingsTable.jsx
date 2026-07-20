@@ -1,6 +1,8 @@
 import { rupees, pnl, signClass } from "../format.js";
 
-// Presentational table of open positions. Data in via props; nothing else.
+// Presentational table of open positions — long and short. The engine stores a
+// short as a negative quantity; here we display abs(qty) plus a SHORT badge,
+// because "-10 shares" reads like a bug to a person. Data in via props.
 export default function HoldingsTable({ holdings, selected, onSelect }) {
   if (!holdings || holdings.length === 0) {
     return <p className="muted">No open holdings.</p>;
@@ -20,8 +22,11 @@ export default function HoldingsTable({ holdings, selected, onSelect }) {
             onClick={() => onSelect?.(h.symbol)}
             className={`${onSelect ? "clickable" : ""} ${selected === h.symbol ? "selected" : ""}`}
           >
-            <td>{h.symbol}</td>
-            <td className="num">{h.quantity}</td>
+            <td>
+              {h.symbol}
+              {h.side === "short" && <span className="tag short" title="Short position — profits if the price falls">SHORT</span>}
+            </td>
+            <td className="num">{Math.abs(h.quantity)}</td>
             <td className="num">{rupees(h.avg_price)}</td>
             <td className="num">
               {rupees(h.last_price)}

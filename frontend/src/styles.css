@@ -76,6 +76,11 @@ h2 { font-size: 17px; margin: 0 0 10px; }
 .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }
 .tag.buy { background: rgba(34,197,94,.15); color: var(--pos); }
 .tag.sell { background: rgba(239,68,68,.15); color: var(--neg); }
+/* short/cover reuse the opposite direction's hue: opening a short is a "bearish"
+   action (amber, distinct from a plain buy), closing it (cover) reads as a win
+   the same way a sell realizing profit does. */
+.tag.short { background: rgba(234,179,8,.18); color: #eab308; }
+.tag.cover { background: rgba(34,197,94,.15); color: var(--pos); }
 .tag.warn { background: rgba(234,179,8,.15); color: #eab308; margin-left: 6px; font-weight: 600; }
 .chip { display: inline-block; padding: 2px 9px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line); font-size: 12px; margin: 3px 4px 0 0; }
 .chip.tagchip { border-color: var(--accent); }

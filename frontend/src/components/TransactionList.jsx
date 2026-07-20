@@ -1,7 +1,10 @@
 import { rupees, pnl, signClass, when } from "../format.js";
 
-// Presentational transaction history. Newest first. Buys are green-ish, sells
-// carry their realized P&L. Data in via props.
+// Buy/short open a position (green/red-outline); sell/cover close one and
+// carry realized P&L.
+const TAG_CLASS = { BUY: "buy", SHORT: "short", SELL: "sell", COVER: "cover" };
+
+// Presentational transaction history. Newest first. Data in via props.
 export default function TransactionList({ transactions }) {
   if (!transactions || transactions.length === 0) {
     return <p className="muted">No transactions yet.</p>;
@@ -19,7 +22,7 @@ export default function TransactionList({ transactions }) {
         {rows.map((t) => (
           <tr key={t.id}>
             <td className="muted">{when(t.timestamp)}</td>
-            <td><span className={`tag ${t.type === "BUY" ? "buy" : "sell"}`}>{t.type}</span></td>
+            <td><span className={`tag ${TAG_CLASS[t.type] || ""}`}>{t.type}</span></td>
             <td>{t.symbol}</td>
             <td className="num">{t.quantity}</td>
             <td className="num">{rupees(t.price)}</td>
