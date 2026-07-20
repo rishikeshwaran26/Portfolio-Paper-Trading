@@ -1,0 +1,581 @@
+"""SQLite repositories — the same public interfaces the JSON stores had.
+
+Every class here is a drop-in replacement for a Phase 1–5 JSON store:
+
+    PortfolioManager(path)        ->  SqlitePortfolioManager(db_path, user_id)
+    AlertStore(path)              ->  AlertRepository(db_path, user_id)
+    SnapshotStore(path)           ->  SnapshotRepository(db_path, user_id)
+    PriceStore(path)              ->  PriceRepository(db_path)
+    UserStore(path)               ->  UserRepository(db_path)
+
+The method names and return types are deliberately unchanged, so the API routes
+and the CLI keep working with almost no edits. That's the payoff of having kept
+persistence behind a seam since Phase 1: swapping the storage engine touches the
+storage layer and nothing else. The trading rules in portfolio.py are untouched.
+
+SqlitePortfolioManager SUBCLASSES PortfolioManager and overrides only load/save,
+so create_strategy / get / delete_strategy / names / leaderboard are inherited
+rather than reimplemented — there's exactly one copy of that logic.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from typing import Optional
+
+from .alerts import ACTIVE, DISMISSED, TRIGGERED, Alert
+from .db import transaction
+from .manager import PortfolioManager
+from .models import ClosedLot, Holding, Transaction
+from .portfolio import Portfolio
+from .snapshots import Snapshot
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# --- portfolios --------------------------------------------------------------
+class SqlitePortfolioManager(PortfolioManager):
+    """One user's strategies, backed by SQLite."""
+
+    def __init__(self, db_path: str, user_id: str):
+        self.db_path = db_path
+        self.user_id = user_id
+        self.portfolios: dict[str, Portfolio] = {}
+        # Set for the base class's benefit; nothing reads it in SQLite mode.
+        self.path = db_path
+
+    # -- load -----------------------------------------------------------------
+    def load(self) -> "SqlitePortfolioManager":
+        """Rebuild every Portfolio object for this user.
+
+        Four queries total (portfolios, holdings, transactions, closed_lots)
+        rather than one per portfolio — avoiding the N+1 query problem.
+        """
+        self.portfolios = {}
+        with transaction(self.db_path) as conn:
+            prows = conn.execute(
+                "SELECT id, name, cash, starting_cash FROM portfolios WHERE user_id = ? ORDER BY id",
+                (self.user_id,),
+            ).fetchall()
+            if not prows:
+                return self
+
+            by_id: dict[int, Portfolio] = {}
+            for r in prows:
+                p = Portfolio(name=r["name"], cash=r["cash"], starting_cash=r["starting_cash"])
+                self.portfolios[r["name"]] = p
+                by_id[r["id"]] = p
+
+            ids = tuple(by_id)
+            marks = ",".join("?" * len(ids))
+
+            for r in conn.execute(
+                f"SELECT portfolio_id, symbol, quantity, avg_price FROM holdings "
+                f"WHERE portfolio_id IN ({marks})",
+                ids,
+            ):
+                by_id[r["portfolio_id"]].holdings[r["symbol"]] = Holding(
+                    symbol=r["symbol"], quantity=r["quantity"], avg_price=r["avg_price"]
+                )
+
+            txn_index: dict[str, Transaction] = {}
+            for r in conn.execute(
+                f"SELECT * FROM transactions WHERE portfolio_id IN ({marks}) ORDER BY portfolio_id, seq",
+                ids,
+            ):
+                t = Transaction(
+                    id=r["id"],
+                    type=r["type"],
+                    symbol=r["symbol"],
+                    quantity=r["quantity"],
+                    price=r["price"],
+                    timestamp=r["timestamp"],
+                    reason=r["reason"],
+                    confidence=r["confidence"],
+                    tags=json.loads(r["tags"]),
+                    open_quantity=r["open_quantity"],
+                    realized_pnl=r["realized_pnl"],
+                    closed_lots=[],
+                    review=r["review"],
+                )
+                by_id[r["portfolio_id"]].transactions.append(t)
+                txn_index[t.id] = t
+
+            if txn_index:
+                lot_marks = ",".join("?" * len(txn_index))
+                for r in conn.execute(
+                    f"SELECT * FROM closed_lots WHERE sell_id IN ({lot_marks}) ORDER BY sell_id, position",
+                    tuple(txn_index),
+                ):
+                    txn_index[r["sell_id"]].closed_lots.append(
+                        ClosedLot(
+                            buy_id=r["buy_id"],
+                            quantity=r["quantity"],
+                            buy_price=r["buy_price"],
+                            sell_price=r["sell_price"],
+                            confidence=r["confidence"],
+                            tags=json.loads(r["tags"]),
+                            holding_days=r["holding_days"],
+                            lot_pnl=r["lot_pnl"],
+                        )
+                    )
+        return self
+
+    # -- save -----------------------------------------------------------------
+    def save(self) -> None:
+        """Persist the in-memory state for this user, atomically.
+
+        Note on approach: we upsert every row for this user rather than tracking
+        a precise dirty-set. Reason — a sell mutates OLD buy rows too (FIFO draws
+        down their open_quantity), and a review edits an existing row, so "only
+        insert new transactions" would be wrong. Upserting a few hundred rows
+        inside one transaction takes single-digit milliseconds, and correctness
+        beats micro-optimisation here. If a journal ever got huge, THIS is the
+        method to make incremental — nothing else would change.
+        """
+        with transaction(self.db_path) as conn:
+            existing = {
+                r["name"]: r["id"]
+                for r in conn.execute(
+                    "SELECT id, name FROM portfolios WHERE user_id = ?", (self.user_id,)
+                )
+            }
+
+            # strategies deleted in memory should disappear from the DB
+            for name, pid in existing.items():
+                if name not in self.portfolios:
+                    conn.execute("DELETE FROM portfolios WHERE id = ?", (pid,))
+
+            for name, p in self.portfolios.items():
+                pid = existing.get(name)
+                if pid is None:
+                    cur = conn.execute(
+                        "INSERT INTO portfolios (user_id, name, cash, starting_cash, created_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (self.user_id, name, p.cash, p.starting_cash, _now()),
+                    )
+                    pid = cur.lastrowid
+                else:
+                    conn.execute(
+                        "UPDATE portfolios SET cash = ?, starting_cash = ? WHERE id = ?",
+                        (p.cash, p.starting_cash, pid),
+                    )
+
+                # holdings: small and fully replaced (a sold-out symbol must go)
+                conn.execute("DELETE FROM holdings WHERE portfolio_id = ?", (pid,))
+                if p.holdings:
+                    conn.executemany(
+                        "INSERT INTO holdings (portfolio_id, symbol, quantity, avg_price) "
+                        "VALUES (?, ?, ?, ?)",
+                        [(pid, h.symbol, h.quantity, h.avg_price) for h in p.holdings.values()],
+                    )
+
+                if p.transactions:
+                    conn.executemany(
+                        "INSERT INTO transactions "
+                        "(id, portfolio_id, seq, type, symbol, quantity, price, timestamp, reason, "
+                        " confidence, tags, open_quantity, realized_pnl, review) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(id) DO UPDATE SET "
+                        "  open_quantity = excluded.open_quantity, "
+                        "  realized_pnl  = excluded.realized_pnl, "
+                        "  review        = excluded.review",
+                        [
+                            (
+                                t.id, pid, seq, t.type, t.symbol, t.quantity, t.price,
+                                t.timestamp, t.reason, t.confidence, json.dumps(t.tags),
+                                t.open_quantity, t.realized_pnl, t.review,
+                            )
+                            for seq, t in enumerate(p.transactions)
+                        ],
+                    )
+                    # closed lots are immutable once written; rewrite per sell
+                    sells = [t for t in p.transactions if t.closed_lots]
+                    if sells:
+                        conn.executemany(
+                            "DELETE FROM closed_lots WHERE sell_id = ?",
+                            [(t.id,) for t in sells],
+                        )
+                        conn.executemany(
+                            "INSERT INTO closed_lots "
+                            "(sell_id, position, buy_id, quantity, buy_price, sell_price, "
+                            " confidence, tags, holding_days, lot_pnl) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                            [
+                                (
+                                    t.id, i, lot.buy_id, lot.quantity, lot.buy_price,
+                                    lot.sell_price, lot.confidence, json.dumps(lot.tags),
+                                    lot.holding_days, lot.lot_pnl,
+                                )
+                                for t in sells
+                                for i, lot in enumerate(t.closed_lots)
+                            ],
+                        )
+
+
+# --- journal analytics in SQL ------------------------------------------------
+class JournalRepository:
+    """Analytics computed by the database instead of Python loops.
+
+    This is the concrete payoff of migrating. The Python version in journal.py
+    loads every transaction and every closed lot into memory to answer "win rate
+    by tag"; here it's one GROUP BY over the closed_lots table. json_each() is
+    how SQLite lets us group by a value inside the JSON tags array.
+
+    journal.py remains the reference implementation, and a test asserts these two
+    produce identical numbers — so there's no risk of the two drifting apart.
+    """
+
+    def __init__(self, db_path: str, user_id: str):
+        self.db_path = db_path
+        self.user_id = user_id
+
+    def performance_by_tag(self, strategy: Optional[str] = None) -> list[dict]:
+        sql = """
+            SELECT
+                tag.value                                        AS label,
+                COUNT(*)                                         AS closed_trades,
+                ROUND(SUM(l.lot_pnl), 2)                         AS total_pnl,
+                ROUND(AVG(l.lot_pnl), 2)                         AS avg_pnl,
+                ROUND(AVG(l.holding_days), 2)                    AS avg_holding_days,
+                SUM(CASE WHEN l.lot_pnl > 0 THEN 1 ELSE 0 END)   AS wins
+            FROM closed_lots l
+            JOIN json_each(l.tags) AS tag
+            JOIN transactions t ON t.id = l.sell_id
+            JOIN portfolios   p ON p.id = t.portfolio_id
+            WHERE p.user_id = ?
+        """
+        params: list = [self.user_id]
+        if strategy:
+            sql += " AND p.name = ?"
+            params.append(strategy)
+        sql += " GROUP BY tag.value ORDER BY total_pnl DESC"
+
+        with transaction(self.db_path) as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [
+            {
+                "label": r["label"],
+                "closed_trades": r["closed_trades"],
+                "total_pnl": r["total_pnl"],
+                "avg_pnl": r["avg_pnl"],
+                "avg_holding_days": r["avg_holding_days"],
+                "win_rate": round(r["wins"] / r["closed_trades"], 4) if r["closed_trades"] else 0.0,
+            }
+            for r in rows
+        ]
+
+
+# --- alerts ------------------------------------------------------------------
+class AlertRepository:
+    """Same interface as engine.alerts.AlertStore, backed by SQLite."""
+
+    def __init__(self, db_path: str, user_id: str):
+        self.db_path = db_path
+        self.user_id = user_id
+
+    def _row_to_alert(self, r) -> Alert:
+        return Alert(
+            id=r["id"], symbol=r["symbol"], target_price=r["target_price"],
+            direction=r["direction"], note=r["note"], status=r["status"],
+            created_at=r["created_at"], triggered_at=r["triggered_at"],
+            triggered_price=r["triggered_price"],
+        )
+
+    @property
+    def alerts(self) -> list[Alert]:
+        with transaction(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM alerts WHERE user_id = ? ORDER BY created_at", (self.user_id,)
+            ).fetchall()
+        return [self._row_to_alert(r) for r in rows]
+
+    def add(self, symbol: str, target_price: float, direction: str, note: str = "") -> Alert:
+        from .alerts import ABOVE, BELOW
+        import uuid
+
+        if direction not in (ABOVE, BELOW):
+            raise ValueError(f"direction must be '{ABOVE}' or '{BELOW}'")
+        if target_price <= 0:
+            raise ValueError("target_price must be positive")
+        alert = Alert(
+            id=uuid.uuid4().hex[:12], symbol=symbol.strip().upper(),
+            target_price=round(float(target_price), 2), direction=direction, note=note.strip(),
+        )
+        with transaction(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO alerts (id, user_id, symbol, target_price, direction, note, status, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (alert.id, self.user_id, alert.symbol, alert.target_price, alert.direction,
+                 alert.note, alert.status, alert.created_at),
+            )
+        return alert
+
+    def get(self, alert_id: str) -> Optional[Alert]:
+        with transaction(self.db_path) as conn:
+            r = conn.execute(
+                "SELECT * FROM alerts WHERE id = ? AND user_id = ?", (alert_id, self.user_id)
+            ).fetchone()
+        return self._row_to_alert(r) if r else None
+
+    def remove(self, alert_id: str) -> bool:
+        with transaction(self.db_path) as conn:
+            cur = conn.execute(
+                "DELETE FROM alerts WHERE id = ? AND user_id = ?", (alert_id, self.user_id)
+            )
+            return cur.rowcount > 0
+
+    def dismiss(self, alert_id: str) -> Optional[Alert]:
+        with transaction(self.db_path) as conn:
+            conn.execute(
+                "UPDATE alerts SET status = ? WHERE id = ? AND user_id = ?",
+                (DISMISSED, alert_id, self.user_id),
+            )
+        return self.get(alert_id)
+
+    def active(self) -> list[Alert]:
+        return [a for a in self.alerts if a.status == ACTIVE]
+
+    def triggered(self) -> list[Alert]:
+        return [a for a in self.alerts if a.status == TRIGGERED]
+
+    def symbols(self) -> list[str]:
+        with transaction(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT symbol FROM alerts WHERE user_id = ? AND status = ?",
+                (self.user_id, ACTIVE),
+            ).fetchall()
+        return sorted(r["symbol"] for r in rows)
+
+    def save(self) -> None:
+        """No-op: every mutation above is already committed. Present so callers
+        written against AlertStore keep working unchanged."""
+
+    def check(self, prices: dict[str, float]) -> list[Alert]:
+        """Fire any active alert whose target the price has crossed.
+
+        The trigger RULE still lives on the Alert dataclass (engine/alerts.py) —
+        we only changed where the data is read from and written to.
+        """
+        fired: list[Alert] = []
+        for a in self.active():
+            price = prices.get(a.symbol)
+            if price is not None and a.should_trigger(price):
+                a.trigger(price)
+                fired.append(a)
+        if fired:
+            with transaction(self.db_path) as conn:
+                conn.executemany(
+                    "UPDATE alerts SET status = ?, triggered_at = ?, triggered_price = ? WHERE id = ?",
+                    [(TRIGGERED, a.triggered_at, a.triggered_price, a.id) for a in fired],
+                )
+        return fired
+
+
+# --- snapshots ---------------------------------------------------------------
+class SnapshotRepository:
+    """Same interface as engine.snapshots.SnapshotStore, backed by SQLite.
+
+    The (user_id, date, strategy) primary key gives us the daily upsert for free:
+    ON CONFLICT DO UPDATE replaces today's row instead of appending a duplicate
+    point — which the JSON version had to do with a manual scan.
+    """
+
+    def __init__(self, db_path: str, user_id: str):
+        self.db_path = db_path
+        self.user_id = user_id
+
+    @property
+    def snapshots(self) -> list[Snapshot]:
+        return self.all()
+
+    def all(self) -> list[Snapshot]:
+        with transaction(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM snapshots WHERE user_id = ? ORDER BY date, strategy",
+                (self.user_id,),
+            ).fetchall()
+        return [
+            Snapshot(
+                date=r["date"], timestamp=r["timestamp"], strategy=r["strategy"],
+                total_value=r["total_value"], return_pct=r["return_pct"], cash=r["cash"],
+                realized_pnl=r["realized_pnl"], unrealized_pnl=r["unrealized_pnl"],
+            )
+            for r in rows
+        ]
+
+    def capture(self, manager, prices: dict[str, float]) -> list[Snapshot]:
+        now = datetime.now(timezone.utc)
+        date = now.strftime("%Y-%m-%d")
+        stamp = now.isoformat()
+        taken = [
+            Snapshot(
+                date=date, timestamp=stamp, strategy=name,
+                total_value=p.total_value(prices), return_pct=p.total_return_pct(prices),
+                cash=p.cash, realized_pnl=p.realized_pnl(),
+                unrealized_pnl=p.unrealized_pnl(prices),
+            )
+            for name, p in manager.portfolios.items()
+        ]
+        if taken:
+            with transaction(self.db_path) as conn:
+                conn.executemany(
+                    "INSERT INTO snapshots "
+                    "(user_id, date, timestamp, strategy, total_value, return_pct, cash, realized_pnl, unrealized_pnl) "
+                    "VALUES (?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(user_id, date, strategy) DO UPDATE SET "
+                    "  timestamp = excluded.timestamp, total_value = excluded.total_value, "
+                    "  return_pct = excluded.return_pct, cash = excluded.cash, "
+                    "  realized_pnl = excluded.realized_pnl, unrealized_pnl = excluded.unrealized_pnl",
+                    [
+                        (self.user_id, s.date, s.timestamp, s.strategy, s.total_value,
+                         s.return_pct, s.cash, s.realized_pnl, s.unrealized_pnl)
+                        for s in taken
+                    ],
+                )
+        return taken
+
+    def save(self) -> None:
+        """No-op — capture() already committed."""
+
+    def series(self, strategies: list[str] | None = None) -> list[dict]:
+        """Chart-shaped: one row per date, one key per strategy."""
+        wanted = set(strategies) if strategies else None
+        by_date: dict[str, dict] = {}
+        for s in self.all():
+            if wanted and s.strategy not in wanted:
+                continue
+            by_date.setdefault(s.date, {"date": s.date})[s.strategy] = s.return_pct
+        return [by_date[d] for d in sorted(by_date)]
+
+    def strategy_names(self) -> list[str]:
+        with transaction(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT strategy FROM snapshots WHERE user_id = ?", (self.user_id,)
+            ).fetchall()
+        return sorted(r["strategy"] for r in rows)
+
+
+# --- prices (shared market data, not per-user) ------------------------------
+class PriceRepository:
+    """Last-known market prices, shared by all users, backed by SQLite."""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+
+    def set_price(self, symbol: str, price: float) -> None:
+        self.set_many({symbol: price})
+
+    def set_many(self, prices: dict[str, float]) -> None:
+        if not prices:
+            return
+        stamp = _now()
+        with transaction(self.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO prices (symbol, price, updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(symbol) DO UPDATE SET price = excluded.price, updated_at = excluded.updated_at",
+                [(s.strip().upper(), round(float(p), 2), stamp) for s, p in prices.items()],
+            )
+
+    def get_all(self) -> dict[str, float]:
+        with transaction(self.db_path) as conn:
+            rows = conn.execute("SELECT symbol, price FROM prices").fetchall()
+        return {r["symbol"]: r["price"] for r in rows}
+
+    def get_prices(self, symbols: list[str]) -> dict[str, float]:
+        if not symbols:
+            return {}
+        syms = [s.strip().upper() for s in symbols]
+        marks = ",".join("?" * len(syms))
+        with transaction(self.db_path) as conn:
+            rows = conn.execute(
+                f"SELECT symbol, price FROM prices WHERE symbol IN ({marks})", syms
+            ).fetchall()
+        return {r["symbol"]: r["price"] for r in rows}
+
+    def updated_at(self) -> dict[str, str]:
+        with transaction(self.db_path) as conn:
+            rows = conn.execute("SELECT symbol, updated_at FROM prices").fetchall()
+        return {r["symbol"]: r["updated_at"] for r in rows}
+
+
+# --- watchlist ---------------------------------------------------------------
+class WatchlistRepository:
+    """Symbols one user is watching — no position required."""
+
+    def __init__(self, db_path: str, user_id: str):
+        self.db_path = db_path
+        self.user_id = user_id
+
+    def add(self, symbol: str) -> str:
+        sym = symbol.strip().upper()
+        with transaction(self.db_path) as conn:
+            # INSERT OR IGNORE: adding a symbol twice is a harmless no-op,
+            # thanks to the (user_id, symbol) primary key.
+            conn.execute(
+                "INSERT OR IGNORE INTO watchlist (user_id, symbol, added_at) VALUES (?,?,?)",
+                (self.user_id, sym, _now()),
+            )
+        return sym
+
+    def remove(self, symbol: str) -> bool:
+        with transaction(self.db_path) as conn:
+            cur = conn.execute(
+                "DELETE FROM watchlist WHERE user_id = ? AND symbol = ?",
+                (self.user_id, symbol.strip().upper()),
+            )
+            return cur.rowcount > 0
+
+    def symbols(self) -> list[str]:
+        with transaction(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT symbol FROM watchlist WHERE user_id = ? ORDER BY added_at",
+                (self.user_id,),
+            ).fetchall()
+        return [r["symbol"] for r in rows]
+
+
+# --- users -------------------------------------------------------------------
+class UserRepository:
+    """Same interface as api.auth.UserStore, backed by SQLite.
+
+    Password hashing still happens in the auth layer — this only stores what it
+    is given. Keeping crypto policy out of the persistence layer means changing
+    the hash algorithm never touches SQL.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+
+    def by_username(self, username: str) -> Optional[dict]:
+        with transaction(self.db_path) as conn:
+            # username is COLLATE NOCASE, so this is a case-insensitive match
+            r = conn.execute(
+                "SELECT * FROM users WHERE username = ?", (username.strip(),)
+            ).fetchone()
+        return dict(r) if r else None
+
+    def by_id(self, user_id: str) -> Optional[dict]:
+        with transaction(self.db_path) as conn:
+            r = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(r) if r else None
+
+    def insert(self, user: dict) -> dict:
+        with transaction(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO users (id, username, password_hash, created_at) VALUES (?,?,?,?)",
+                (user["id"], user["username"], user["password_hash"], user["created_at"]),
+            )
+        return user
+
+    def count(self) -> int:
+        with transaction(self.db_path) as conn:
+            return conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+
+    def all_ids(self) -> list[str]:
+        with transaction(self.db_path) as conn:
+            rows = conn.execute("SELECT id FROM users ORDER BY created_at").fetchall()
+        return [r["id"] for r in rows]

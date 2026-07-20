@@ -1,0 +1,18 @@
+# Phase 1 engine has ZERO runtime dependencies — pure standard-library Python.
+
+# --- Phase 2: REST API ---
+Flask>=3.0
+Flask-Cors>=4.0
+
+# --- Phase 4: live market data ---
+# nsepython scrapes NSE's public site for real-time quotes. There is no free
+# official API. NSE blocks many datacenter/cloud IPs (HTTP 403) — it generally
+# works from an ordinary Indian home connection. Run `python -m engine.pricecheck`
+# to see whether it works where YOU are.
+nsepython>=2.0
+# yfinance is the fallback: ~15min delayed, but reliable from anywhere, and the
+# only source here that provides history for the price charts.
+yfinance>=0.2
+
+# --- dev / tests ---
+pytest>=8.0
