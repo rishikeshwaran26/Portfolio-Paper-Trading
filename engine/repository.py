@@ -504,38 +504,110 @@ class PriceRepository:
 
 # --- watchlist ---------------------------------------------------------------
 class WatchlistRepository:
-    """Symbols one user is watching — no position required."""
+    """A user's NAMED watchlists — e.g. "Swing", "Intraday" — each holding its
+    own set of symbols. A user can have several; the same symbol can appear in
+    more than one list at once (they're independent). Names are not required
+    to be unique, on request — keep this simple rather than mirroring the
+    strategy-name-uniqueness rule.
+
+    Every method that takes a watchlist_id first confirms it belongs to this
+    user (same principle as _get_portfolio's 404 in api/routes.py) — ids are
+    plain sequential integers, so without this check one user could poke at
+    another user's list by guessing an id.
+    """
 
     def __init__(self, db_path: str, user_id: str):
         self.db_path = db_path
         self.user_id = user_id
 
-    def add(self, symbol: str) -> str:
+    def _owns(self, conn, watchlist_id: int) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM watchlists WHERE id = ? AND user_id = ?",
+            (watchlist_id, self.user_id),
+        ).fetchone()
+        return row is not None
+
+    def list_all(self) -> list[dict]:
+        """Every one of this user's watchlists, each with its own symbols,
+        newest-created first isn't required — insertion order is fine."""
+        with transaction(self.db_path) as conn:
+            lists = conn.execute(
+                "SELECT id, name, created_at FROM watchlists WHERE user_id = ? ORDER BY id",
+                (self.user_id,),
+            ).fetchall()
+            out = []
+            for wl in lists:
+                items = conn.execute(
+                    "SELECT symbol FROM watchlist_items WHERE watchlist_id = ? ORDER BY added_at",
+                    (wl["id"],),
+                ).fetchall()
+                out.append(
+                    {
+                        "id": wl["id"],
+                        "name": wl["name"],
+                        "created_at": wl["created_at"],
+                        "symbols": [i["symbol"] for i in items],
+                    }
+                )
+        return out
+
+    def create(self, name: str) -> dict:
+        name = name.strip()
+        if not name:
+            raise ValueError("watchlist name is required")
+        stamp = _now()
+        with transaction(self.db_path) as conn:
+            cur = conn.execute(
+                "INSERT INTO watchlists (user_id, name, created_at) VALUES (?, ?, ?)",
+                (self.user_id, name, stamp),
+            )
+            watchlist_id = cur.lastrowid
+        return {"id": watchlist_id, "name": name, "created_at": stamp, "symbols": []}
+
+    def delete(self, watchlist_id: int) -> bool:
+        with transaction(self.db_path) as conn:
+            if not self._owns(conn, watchlist_id):
+                return False
+            conn.execute("DELETE FROM watchlists WHERE id = ?", (watchlist_id,))
+        return True
+
+    def add_symbol(self, watchlist_id: int, symbol: str) -> str | None:
+        """Returns the normalized symbol on success, None if this watchlist
+        doesn't belong to this user (the route turns that into a 404)."""
         sym = symbol.strip().upper()
         with transaction(self.db_path) as conn:
-            # INSERT OR IGNORE: adding a symbol twice is a harmless no-op,
-            # thanks to the (user_id, symbol) primary key.
+            if not self._owns(conn, watchlist_id):
+                return None
+            # INSERT OR IGNORE: adding a symbol twice to the SAME list is a
+            # harmless no-op, thanks to the (watchlist_id, symbol) primary key.
             conn.execute(
-                "INSERT OR IGNORE INTO watchlist (user_id, symbol, added_at) VALUES (?,?,?)",
-                (self.user_id, sym, _now()),
+                "INSERT OR IGNORE INTO watchlist_items (watchlist_id, symbol, added_at) VALUES (?, ?, ?)",
+                (watchlist_id, sym, _now()),
             )
         return sym
 
-    def remove(self, symbol: str) -> bool:
+    def remove_symbol(self, watchlist_id: int, symbol: str) -> bool:
         with transaction(self.db_path) as conn:
+            if not self._owns(conn, watchlist_id):
+                return False
             cur = conn.execute(
-                "DELETE FROM watchlist WHERE user_id = ? AND symbol = ?",
-                (self.user_id, symbol.strip().upper()),
+                "DELETE FROM watchlist_items WHERE watchlist_id = ? AND symbol = ?",
+                (watchlist_id, symbol.strip().upper()),
             )
             return cur.rowcount > 0
 
-    def symbols(self) -> list[str]:
+    def all_symbols(self) -> list[str]:
+        """Every symbol across ALL of this user's watchlists, de-duplicated —
+        used to know what to fetch live prices for (a stock watched in two
+        lists only needs fetching once)."""
         with transaction(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT symbol FROM watchlist WHERE user_id = ? ORDER BY added_at",
+                "SELECT DISTINCT wi.symbol FROM watchlist_items wi "
+                "JOIN watchlists w ON w.id = wi.watchlist_id "
+                "WHERE w.user_id = ?",
                 (self.user_id,),
             ).fetchall()
-        return [r["symbol"] for r in rows]
+        return sorted(r["symbol"] for r in rows)
 
 
 # --- users -------------------------------------------------------------------

@@ -433,18 +433,42 @@ def _quotes_for(syms: list[str]) -> list[dict]:
     return rows
 
 
-@bp.get("/watchlist")
+@bp.get("/watchlists")
 @require_auth
-def get_watchlist():
-    syms = g.data.watchlist().symbols()
-    return jsonify({"watchlist": _quotes_for(syms), "market_open": market_is_open()})
+def list_watchlists():
+    """Every one of the user's named watchlists, each with live quotes for its
+    own symbols. No auto-created default — a brand-new user just sees an empty
+    list and the UI prompts them to create the first one."""
+    lists = g.data.watchlist().list_all()
+    for wl in lists:
+        wl["stocks"] = _quotes_for(wl.pop("symbols"))
+    return jsonify({"watchlists": lists, "market_open": market_is_open()})
 
 
-@bp.post("/watchlist")
+@bp.post("/watchlists")
 @require_auth
-def add_to_watchlist():
+def create_watchlist():
     body = json_body()
-    sym = g.data.watchlist().add(req_str(body, "symbol"))
+    wl = g.data.watchlist().create(req_str(body, "name"))
+    wl["stocks"] = wl.pop("symbols")
+    return jsonify({"watchlist": wl}), 201
+
+
+@bp.delete("/watchlists/<int:watchlist_id>")
+@require_auth
+def delete_watchlist(watchlist_id: int):
+    if not g.data.watchlist().delete(watchlist_id):
+        raise ApiError(404, "NotFound", f"no watchlist with id {watchlist_id}")
+    return jsonify({"deleted": watchlist_id})
+
+
+@bp.post("/watchlists/<int:watchlist_id>/symbols")
+@require_auth
+def add_watchlist_symbol(watchlist_id: int):
+    body = json_body()
+    sym = g.data.watchlist().add_symbol(watchlist_id, req_str(body, "symbol"))
+    if sym is None:
+        raise ApiError(404, "NotFound", f"no watchlist with id {watchlist_id}")
     # Fetch a price immediately so the new row isn't blank until the next
     # worker tick.
     source = current_app.config.get("PRICE_SOURCE")
@@ -458,11 +482,11 @@ def add_to_watchlist():
     return jsonify({"symbol": sym}), 201
 
 
-@bp.delete("/watchlist/<symbol>")
+@bp.delete("/watchlists/<int:watchlist_id>/symbols/<symbol>")
 @require_auth
-def remove_from_watchlist(symbol: str):
-    if not g.data.watchlist().remove(symbol):
-        raise ApiError(404, "NotFound", f"'{symbol.upper()}' is not on the watchlist")
+def remove_watchlist_symbol(watchlist_id: int, symbol: str):
+    if not g.data.watchlist().remove_symbol(watchlist_id, symbol):
+        raise ApiError(404, "NotFound", f"'{symbol.upper()}' is not in watchlist {watchlist_id}")
     return jsonify({"removed": symbol.strip().upper()})
 
 

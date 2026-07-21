@@ -114,13 +114,17 @@ export const api = {
   setPrice: (symbol, price) =>
     request(`/prices/${enc(symbol)}`, { method: "PUT", body: JSON.stringify({ price }) }),
 
-  // symbols + quotes + watchlist
+  // symbols + quotes + named watchlists
   searchSymbols: (q) => request(`/symbols/search?q=${enc(q)}`),
   quote: (symbol) => request(`/prices/quote/${enc(symbol)}`),
-  watchlist: () => request("/watchlist"),
-  addToWatchlist: (symbol) =>
-    request("/watchlist", { method: "POST", body: JSON.stringify({ symbol }) }),
-  removeFromWatchlist: (symbol) => request(`/watchlist/${enc(symbol)}`, { method: "DELETE" }),
+  listWatchlists: () => request("/watchlists"),
+  createWatchlist: (name) =>
+    request("/watchlists", { method: "POST", body: JSON.stringify({ name }) }),
+  deleteWatchlist: (id) => request(`/watchlists/${enc(id)}`, { method: "DELETE" }),
+  addToWatchlist: (id, symbol) =>
+    request(`/watchlists/${enc(id)}/symbols`, { method: "POST", body: JSON.stringify({ symbol }) }),
+  removeFromWatchlist: (id, symbol) =>
+    request(`/watchlists/${enc(id)}/symbols/${enc(symbol)}`, { method: "DELETE" }),
 
   // live prices (Phase 4)
   refreshPrices: () => request("/prices/refresh", { method: "POST" }),

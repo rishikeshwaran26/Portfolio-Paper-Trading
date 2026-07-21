@@ -125,6 +125,13 @@ def create_app(
                     "POST   /prices/refresh",
                     "GET    /prices/sources",
                     "GET    /prices/<symbol>/history",
+                    "GET    /prices/quote/<symbol>",
+                    "GET    /symbols/search",
+                    "GET    /watchlists",
+                    "POST   /watchlists",
+                    "DELETE /watchlists/<id>",
+                    "POST   /watchlists/<id>/symbols",
+                    "DELETE /watchlists/<id>/symbols/<symbol>",
                 ],
             }
         )

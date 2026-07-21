@@ -6,42 +6,21 @@ import SymbolSearch from "../components/SymbolSearch.jsx";
 import PriceChart from "../components/PriceChart.jsx";
 import { rupees, signClass } from "../format.js";
 
-// The watchlist — symbols you're tracking without holding. Quotes auto-refresh
-// every 15s (the page-level poll), each row shows the day's change vs previous
-// close, and clicking a row opens its price chart below. This is the page that
-// makes the app feel like Groww's watch screen.
+// Multiple NAMED watchlists (e.g. "Swing", "Intraday"), each tracking its own
+// set of symbols — the same stock can sit in more than one list at once, since
+// what you're watching it FOR differs per list. Quotes auto-refresh every 15s
+// (the page-level poll). This is the page that makes the app feel like
+// Groww's watch screen, just with your own groupings on top.
 export default function WatchlistPage() {
-  const { data, loading, error, reload } = useApi(() => api.watchlist(), [], { refreshMs: 15_000 });
-  const [query, setQuery] = useState("");
-  const [adding, setAdding] = useState(false);
+  const { data, loading, error, reload } = useApi(() => api.listWatchlists(), [], { refreshMs: 15_000 });
   const [chartSymbol, setChartSymbol] = useState(null);
 
-  async function add(symbol) {
-    if (!symbol.trim()) return;
-    setAdding(true);
-    try {
-      await api.addToWatchlist(symbol.trim());
-      setQuery("");
-      reload();
-    } catch {
-      /* row simply won't appear; the banner covers persistent failures */
-    } finally {
-      setAdding(false);
-    }
-  }
-
-  async function remove(symbol) {
-    await api.removeFromWatchlist(symbol).catch(() => {});
-    if (chartSymbol === symbol) setChartSymbol(null);
-    reload();
-  }
-
-  const rows = data?.watchlist ?? [];
+  const lists = data?.watchlists ?? [];
 
   return (
     <div className="page">
       <h1>
-        Watchlist{" "}
+        Watchlists{" "}
         {data && (
           <span className="source-chip">
             <span className={`live-dot ${data.market_open ? "" : "closed"}`} />
@@ -50,32 +29,146 @@ export default function WatchlistPage() {
         )}
       </h1>
 
-      <div className="card">
-        <div className="card-title">Add a stock</div>
-        <div className="row" style={{ alignItems: "end" }}>
-          <label style={{ flex: 1 }}>
-            Search by symbol or company name
-            <SymbolSearch
-              value={query}
-              onChange={setQuery}
-              onSelect={(r) => add(r.symbol)}
-              placeholder="e.g. tata, INFY, bank…"
-            />
-          </label>
-          <button className="primary" disabled={!query.trim() || adding} onClick={() => add(query)}>
-            {adding ? "Adding…" : "Add"}
-          </button>
-        </div>
-      </div>
+      <NewWatchlistForm onCreated={reload} />
 
-      {loading && <Loading label="Loading watchlist…" />}
+      {loading && <Loading label="Loading watchlists…" />}
       <ErrorBanner error={error} onRetry={reload} />
 
-      {data && rows.length === 0 && (
-        <p className="muted">Nothing watched yet — search above to add stocks.</p>
+      {data && lists.length === 0 && (
+        <p className="muted">
+          No watchlists yet — create one above (e.g. “Swing”, “Intraday”) to start tracking stocks.
+        </p>
       )}
 
-      {rows.length > 0 && (
+      {lists.map((wl) => (
+        <WatchlistCard
+          key={wl.id}
+          watchlist={wl}
+          onChanged={reload}
+          chartSymbol={chartSymbol}
+          onChartSymbol={setChartSymbol}
+        />
+      ))}
+
+      {chartSymbol && (
+        <div style={{ marginTop: 16 }}>
+          <PriceChart symbol={chartSymbol} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Owns ONLY its own name-input state. Calls onCreated() so the parent
+// refetches the (now longer) list of watchlists — same pattern as
+// CreateStrategyForm.
+function NewWatchlistForm({ onCreated }) {
+  const [name, setName] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState(null);
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!name.trim()) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      await api.createWatchlist(name.trim());
+      setName("");
+      onCreated?.();
+    } catch (err) {
+      setError(err);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <form className="card" onSubmit={submit}>
+      <div className="card-title">New watchlist</div>
+      <div className="row" style={{ alignItems: "end" }}>
+        <label style={{ flex: 1 }}>
+          Name
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Swing, Intraday" />
+        </label>
+        <button className="primary" disabled={!name.trim() || submitting}>
+          {submitting ? "Creating…" : "Create watchlist"}
+        </button>
+      </div>
+      {error && <div className="inline-error">{error.message}</div>}
+    </form>
+  );
+}
+
+// One named watchlist: its own "add stock" search box, its own table of
+// quotes, and a delete-this-list action. Owns only its local add/query state —
+// the actual data lives in the parent and flows down as the `watchlist` prop,
+// so any change here triggers onChanged() to refetch the whole page.
+function WatchlistCard({ watchlist, onChanged, chartSymbol, onChartSymbol }) {
+  const [query, setQuery] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  async function add(symbol) {
+    if (!symbol.trim()) return;
+    setAdding(true);
+    try {
+      await api.addToWatchlist(watchlist.id, symbol.trim());
+      setQuery("");
+      onChanged?.();
+    } catch {
+      /* row simply won't appear; a persistent failure would show elsewhere */
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  async function removeSymbol(symbol) {
+    await api.removeFromWatchlist(watchlist.id, symbol).catch(() => {});
+    if (chartSymbol === symbol) onChartSymbol(null);
+    onChanged?.();
+  }
+
+  async function deleteList() {
+    await api.deleteWatchlist(watchlist.id).catch(() => {});
+    onChanged?.();
+  }
+
+  const stocks = watchlist.stocks ?? [];
+
+  return (
+    <section className="card">
+      <div className="card-title">
+        <span>{watchlist.name}</span>
+        {confirmDelete ? (
+          <span>
+            <span className="muted" style={{ fontSize: 13, marginRight: 6 }}>delete this list?</span>
+            <button className="link" onClick={deleteList} style={{ color: "var(--neg)" }}>yes, delete</button>
+            <button className="link" onClick={() => setConfirmDelete(false)} style={{ marginLeft: 8 }}>cancel</button>
+          </span>
+        ) : (
+          <button className="link" onClick={() => setConfirmDelete(true)}>delete list</button>
+        )}
+      </div>
+
+      <div className="row" style={{ alignItems: "end", marginBottom: 12 }}>
+        <label style={{ flex: 1 }}>
+          Add a stock
+          <SymbolSearch
+            value={query}
+            onChange={setQuery}
+            onSelect={(r) => add(r.symbol)}
+            placeholder="e.g. tata, INFY, bank…"
+          />
+        </label>
+        <button className="primary" disabled={!query.trim() || adding} onClick={() => add(query)}>
+          {adding ? "Adding…" : "Add"}
+        </button>
+      </div>
+
+      {stocks.length === 0 ? (
+        <p className="muted">Nothing in this list yet — search above to add stocks.</p>
+      ) : (
         <table className="table">
           <thead>
             <tr>
@@ -84,11 +177,11 @@ export default function WatchlistPage() {
             </tr>
           </thead>
           <tbody>
-            {rows.map((r) => (
+            {stocks.map((r) => (
               <tr
                 key={r.symbol}
                 className={`clickable ${chartSymbol === r.symbol ? "selected" : ""}`}
-                onClick={() => setChartSymbol(r.symbol)}
+                onClick={() => onChartSymbol(r.symbol)}
               >
                 <td><strong>{r.symbol}</strong></td>
                 <td className="muted">{r.name ?? "—"}</td>
@@ -99,10 +192,7 @@ export default function WatchlistPage() {
                     : "—"}
                 </td>
                 <td>
-                  <button
-                    className="link"
-                    onClick={(e) => { e.stopPropagation(); remove(r.symbol); }}
-                  >
+                  <button className="link" onClick={(e) => { e.stopPropagation(); removeSymbol(r.symbol); }}>
                     remove
                   </button>
                 </td>
@@ -111,12 +201,6 @@ export default function WatchlistPage() {
           </tbody>
         </table>
       )}
-
-      {chartSymbol && (
-        <div style={{ marginTop: 16 }}>
-          <PriceChart symbol={chartSymbol} />
-        </div>
-      )}
-    </div>
+    </section>
   );
 }

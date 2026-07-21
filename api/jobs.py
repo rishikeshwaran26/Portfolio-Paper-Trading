@@ -50,7 +50,7 @@ def symbols_of_interest(root: str) -> list[str]:
         rows = conn.execute(
             "SELECT DISTINCT symbol FROM holdings "
             "UNION SELECT DISTINCT symbol FROM alerts WHERE status = 'active' "
-            "UNION SELECT DISTINCT symbol FROM watchlist"
+            "UNION SELECT DISTINCT symbol FROM watchlist_items"
         ).fetchall()
     return sorted(r["symbol"] for r in rows)
 

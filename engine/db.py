@@ -42,6 +42,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 SCHEMA_VERSION = 1
 
@@ -136,13 +137,25 @@ CREATE TABLE IF NOT EXISTS snapshots (
     PRIMARY KEY (user_id, date, strategy)
 );
 
--- Symbols a user is watching (no position needed). The composite key makes
--- adding the same symbol twice a natural no-op via INSERT OR IGNORE.
-CREATE TABLE IF NOT EXISTS watchlist (
-    user_id  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    symbol   TEXT NOT NULL,
-    added_at TEXT NOT NULL,
-    PRIMARY KEY (user_id, symbol)
+-- Named watchlists: a user can keep several (e.g. "Swing", "Intraday"), each
+-- with its own set of symbols. No unique constraint on (user_id, name) —
+-- duplicate names are allowed on purpose (kept simple on request).
+CREATE TABLE IF NOT EXISTS watchlists (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_watchlists_user ON watchlists(user_id);
+
+-- Symbols within one named watchlist. The composite key makes adding the same
+-- symbol twice to the same list a natural no-op via INSERT OR IGNORE — but the
+-- same symbol CAN appear in more than one watchlist (different watchlist_id).
+CREATE TABLE IF NOT EXISTS watchlist_items (
+    watchlist_id INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
+    symbol       TEXT NOT NULL,
+    added_at     TEXT NOT NULL,
+    PRIMARY KEY (watchlist_id, symbol)
 );
 
 -- Prices are MARKET data: shared by every user, not scoped to one.
@@ -202,6 +215,39 @@ def init_db(db_path: str) -> None:
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
+        _migrate_legacy_watchlist(conn)
+
+
+def _migrate_legacy_watchlist(conn: sqlite3.Connection) -> None:
+    """One-time migration: watchlists used to be one flat, unnamed list per
+    user. They're now named and a user can have several. Existing entries move
+    into a single watchlist called "Watchlist" per user, then the old table is
+    dropped — after this runs once, the old table is gone and this is a no-op
+    on every later startup.
+    """
+    exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='watchlist'"
+    ).fetchone()
+    if not exists:
+        return
+
+    rows = conn.execute("SELECT user_id, symbol, added_at FROM watchlist").fetchall()
+    by_user: dict[str, list[tuple[str, str]]] = {}
+    for r in rows:
+        by_user.setdefault(r["user_id"], []).append((r["symbol"], r["added_at"]))
+
+    for user_id, items in by_user.items():
+        cur = conn.execute(
+            "INSERT INTO watchlists (user_id, name, created_at) VALUES (?, ?, ?)",
+            (user_id, "Watchlist", datetime.now(timezone.utc).isoformat()),
+        )
+        watchlist_id = cur.lastrowid
+        conn.executemany(
+            "INSERT OR IGNORE INTO watchlist_items (watchlist_id, symbol, added_at) VALUES (?, ?, ?)",
+            [(watchlist_id, symbol, added_at) for symbol, added_at in items],
+        )
+
+    conn.execute("DROP TABLE watchlist")
 
 
 def schema_version(db_path: str) -> int:
