@@ -96,6 +96,31 @@ def test_get_unknown_strategy_returns_404(client):
     assert r.get_json()["error"]["type"] == "NotFound"
 
 
+def test_delete_strategy_removes_it(client):
+    _create(client, "Doomed")
+    _buy(client, "Doomed")  # give it a holding + transaction to cascade-delete
+    r = client.delete("/strategies/Doomed")
+    assert r.status_code == 200
+    assert r.get_json()["deleted"] == "Doomed"
+    # gone from the list and individually 404s now
+    assert client.get("/strategies").get_json()["strategies"] == []
+    assert client.get("/strategies/Doomed").status_code == 404
+
+
+def test_delete_unknown_strategy_returns_404(client):
+    r = client.delete("/strategies/Ghost")
+    assert r.status_code == 404
+    assert r.get_json()["error"]["type"] == "NotFound"
+
+
+def test_delete_strategy_leaves_others(client):
+    _create(client, "Keep")
+    _create(client, "Drop")
+    client.delete("/strategies/Drop")
+    names = {s["name"] for s in client.get("/strategies").get_json()["strategies"]}
+    assert names == {"Keep"}
+
+
 # --- buy ---------------------------------------------------------------------
 def test_buy_succeeds_and_reduces_cash(client):
     _create(client)

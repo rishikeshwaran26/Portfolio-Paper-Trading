@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useParams, Link } from "react-router-dom";
+import { useParams, Link, useNavigate } from "react-router-dom";
 import { useApi } from "../useApi.js";
 import { api } from "../api.js";
 import { Loading, ErrorBanner } from "../components/Status.jsx";
@@ -18,10 +18,23 @@ export default function StrategyDetailPage() {
   const { name } = useParams();
   // refreshMs: P&L re-renders on its own as the background worker moves prices
   const { data, loading, error, reload } = useApi(() => api.getStrategy(name), [name], { refreshMs: 20_000 });
+  const navigate = useNavigate();
   // Which holding's price chart to show. Defaults to the first holding once
   // data arrives; the user can switch by clicking a row.
   const [chartSymbol, setChartSymbol] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  async function removeStrategy() {
+    setDeleting(true);
+    try {
+      await api.deleteStrategy(name);
+      navigate("/"); // back to the dashboard; the deleted strategy is gone
+    } catch {
+      setDeleting(false); // an error banner shows on the next interaction
+    }
+  }
 
   useEffect(() => {
     if (!chartSymbol && data?.holdings?.length) setChartSymbol(data.holdings[0].symbol);
@@ -53,6 +66,21 @@ export default function StrategyDetailPage() {
         <button className="link" style={{ marginLeft: 12, fontSize: 14 }} onClick={refreshLive} disabled={refreshing}>
           {refreshing ? "refreshing…" : "↻ refresh live prices"}
         </button>
+        {confirmDelete ? (
+          <span style={{ marginLeft: 12, fontSize: 14 }}>
+            <span className="muted">delete this strategy and all its trades?</span>
+            <button className="link" style={{ color: "var(--neg)", marginLeft: 8 }} onClick={removeStrategy} disabled={deleting}>
+              {deleting ? "deleting…" : "yes, delete"}
+            </button>
+            <button className="link" style={{ marginLeft: 8 }} onClick={() => setConfirmDelete(false)} disabled={deleting}>
+              cancel
+            </button>
+          </span>
+        ) : (
+          <button className="link" style={{ marginLeft: 12, fontSize: 14, color: "var(--neg)" }} onClick={() => setConfirmDelete(true)}>
+            delete strategy
+          </button>
+        )}
       </h1>
 
       <div className="summary-row">
