@@ -11,6 +11,7 @@ import LeaderboardPage from "./pages/LeaderboardPage.jsx";
 import ComparePage from "./pages/ComparePage.jsx";
 import AlertsPage from "./pages/AlertsPage.jsx";
 import WatchlistPage from "./pages/WatchlistPage.jsx";
+import ScreenerPage from "./pages/ScreenerPage.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
 import { api } from "./api.js";
 import { getToken, clearToken } from "./auth.js";
@@ -63,6 +64,7 @@ export default function App() {
           <Route path="/strategies/:name/analytics" element={<AnalyticsPage />} />
           <Route path="/leaderboard" element={<LeaderboardPage />} />
           <Route path="/watchlist" element={<WatchlistPage />} />
+          <Route path="/screener" element={<ScreenerPage />} />
           <Route path="/compare" element={<ComparePage />} />
           <Route path="/alerts" element={<AlertsPage />} />
         </Routes>

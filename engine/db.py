@@ -164,7 +164,70 @@ CREATE TABLE IF NOT EXISTS prices (
     price      REAL NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Screener runs: one row per whole-market scan. Like prices, this is MARKET
+-- data (the day's movers are the same for everyone) so it is NOT user-scoped —
+-- any user's scan populates it and every user reads the same latest result.
+CREATE TABLE IF NOT EXISTS screener_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_date       TEXT NOT NULL,            -- YYYY-MM-DD (IST) the scan is "for"
+    started_at      TEXT NOT NULL,
+    finished_at     TEXT,
+    status          TEXT NOT NULL,            -- running | done | error
+    universe_count  INTEGER NOT NULL DEFAULT 0,
+    scanned_count   INTEGER NOT NULL DEFAULT 0,
+    mover_count     INTEGER NOT NULL DEFAULT 0,
+    source          TEXT NOT NULL DEFAULT '', -- how the universe was obtained
+    error           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_screener_runs_date ON screener_runs(scan_date);
+
+-- One row per qualifying mover within a run. Denormalised on purpose: a scan is
+-- written once and read as a whole, so the enrichment (52w context, news,
+-- reasons) rides along as columns / JSON rather than in join tables.
+CREATE TABLE IF NOT EXISTS screener_movers (
+    run_id          INTEGER NOT NULL REFERENCES screener_runs(id) ON DELETE CASCADE,
+    symbol          TEXT    NOT NULL,
+    name            TEXT    NOT NULL DEFAULT '',
+    price           REAL    NOT NULL,
+    prev_close      REAL    NOT NULL,
+    pct_change      REAL    NOT NULL,
+    volume          INTEGER NOT NULL DEFAULT 0,
+    avg_volume      INTEGER NOT NULL DEFAULT 0,
+    vol_ratio       REAL    NOT NULL DEFAULT 0,
+    vol_diff_1w_pct REAL,
+    bracket         TEXT    NOT NULL,            -- up_5_10 | up_10_15 | ... | down_15_plus
+    direction       TEXT    NOT NULL,            -- up | down
+    week52_high     REAL,
+    week52_low      REAL,
+    week52_pct      REAL,                        -- position in 52w range, 0–100
+    near_high       INTEGER NOT NULL DEFAULT 0,  -- 0/1
+    near_low        INTEGER NOT NULL DEFAULT 0,
+    rsi             REAL,
+    macd_bullish    INTEGER,                     -- 0/1/NULL
+    macd_hist       REAL,
+    spark           TEXT    NOT NULL DEFAULT '[]',  -- JSON list of recent closes
+    results_recent  INTEGER NOT NULL DEFAULT 0,
+    results_date    TEXT,
+    news            TEXT    NOT NULL DEFAULT '[]',
+    reasons         TEXT    NOT NULL DEFAULT '[]',
+    PRIMARY KEY (run_id, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_screener_movers_run ON screener_movers(run_id);
 """
+
+# Columns added to screener_movers after its first release. init_db ALTERs them
+# in for existing databases (SQLite has no "ADD COLUMN IF NOT EXISTS").
+_SCREENER_MOVER_ADDED_COLUMNS = [
+    ("vol_diff_1w_pct", "REAL"),
+    ("week52_pct", "REAL"),
+    ("rsi", "REAL"),
+    ("macd_bullish", "INTEGER"),
+    ("macd_hist", "REAL"),
+    ("spark", "TEXT NOT NULL DEFAULT '[]'"),
+    ("results_recent", "INTEGER NOT NULL DEFAULT 0"),
+    ("results_date", "TEXT"),
+]
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -216,6 +279,19 @@ def init_db(db_path: str) -> None:
                 (str(SCHEMA_VERSION),),
             )
         _migrate_legacy_watchlist(conn)
+        _migrate_screener_columns(conn)
+
+
+def _migrate_screener_columns(conn: sqlite3.Connection) -> None:
+    """Add later screener_movers columns to a pre-existing database. Idempotent:
+    checks the current columns first and only ALTERs in the missing ones, so
+    it's a no-op on every startup after the first."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(screener_movers)")}
+    if not existing:
+        return  # table not created yet (fresh DB just built it with all columns)
+    for name, decl in _SCREENER_MOVER_ADDED_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE screener_movers ADD COLUMN {name} {decl}")
 
 
 def _migrate_legacy_watchlist(conn: sqlite3.Connection) -> None:

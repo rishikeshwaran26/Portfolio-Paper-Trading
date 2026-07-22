@@ -28,6 +28,8 @@ multi-user a data change rather than a rewrite.
 
 from __future__ import annotations
 
+import os
+
 from flask import Blueprint, current_app, g, jsonify, request
 
 from engine import symbols
@@ -41,11 +43,21 @@ from engine.journal import (
 )
 from engine.manager import DEFAULT_STARTING_CASH
 from engine.portfolio import Portfolio
+from engine.repository import ScreenerRepository
+from engine.screener import BRACKETS
 
 from .auth import require_auth
 from .errors import ApiError
 from .jobs import capture_snapshot_for_user, refresh_live_prices
+from .paths import db_file
 from .validation import json_body, opt_str, opt_tags, req_int, req_num, req_str
+
+# Where the cached NSE universe CSV lives, relative to the data root.
+UNIVERSE_CACHE_FILE = "nse_universe.csv"
+
+
+def screener_cache_path(root: str) -> str:
+    return os.path.join(root, UNIVERSE_CACHE_FILE)
 
 bp = Blueprint("api", __name__)
 
@@ -160,6 +172,19 @@ def get_strategy(name: str):
     p = _get_portfolio(manager, name)
     prices = _prices_for(manager, _price_store())
     return jsonify(_detail(p, prices))
+
+
+@bp.delete("/strategies/<name>")
+@require_auth
+def delete_strategy(name: str):
+    """Permanently remove a strategy — its holdings, transactions and closed
+    lots all cascade-delete with it (see the FK ON DELETE CASCADE in db.py).
+    There's no undo, which is why the frontend gates this behind a confirm."""
+    manager = _manager()
+    _get_portfolio(manager, name)  # 404 if it doesn't exist / isn't yours
+    manager.delete_strategy(name)
+    manager.save()
+    return jsonify({"deleted": name})
 
 
 # --- trading -----------------------------------------------------------------
@@ -488,6 +513,69 @@ def remove_watchlist_symbol(watchlist_id: int, symbol: str):
     if not g.data.watchlist().remove_symbol(watchlist_id, symbol):
         raise ApiError(404, "NotFound", f"'{symbol.upper()}' is not in watchlist {watchlist_id}")
     return jsonify({"removed": symbol.strip().upper()})
+
+
+# --- screener (whole-market daily movers) -----------------------------------
+# These read/write GLOBAL market data (the day's movers are the same for every
+# user), so they use a db-path-scoped ScreenerRepository rather than g.data.
+def _screener_repo() -> ScreenerRepository:
+    return ScreenerRepository(db_file(g.data.root))
+
+
+def _bracket_meta() -> list[dict]:
+    """Bracket keys + labels for the frontend to render section headers in the
+    right order without hardcoding them."""
+    return [
+        {"key": key, "label": label, "direction": direction, "low": lo}
+        for key, label, lo, _hi, direction in BRACKETS
+    ]
+
+
+@bp.get("/screener")
+@require_auth
+def get_screener():
+    """The latest completed scan (grouped by bracket) plus the live status of any
+    scan currently running. A brand-new install has no scan yet -> latest is
+    null and the UI shows a 'Scan now' prompt."""
+    service = current_app.config["SCREENER_SERVICE"]
+    latest = _screener_repo().latest_done()
+    return jsonify(
+        {
+            "latest": latest,               # {run, buckets} or null
+            "status": service.snapshot(),   # live progress of an in-flight scan
+            "brackets": _bracket_meta(),
+            "market_open": market_is_open(),
+        }
+    )
+
+
+@bp.post("/screener/scan")
+@require_auth
+def start_screener_scan():
+    """Trigger a fresh whole-market scan in the background. Returns 202 with the
+    initial status; the client then polls GET /screener/status."""
+    service = current_app.config["SCREENER_SERVICE"]
+    data = current_app.config.get("SCREENER_DATA")
+    if data is None:
+        raise ApiError(
+            503, "ScreenerUnavailable",
+            "the screener needs a live market data source; it's disabled in manual/offline mode",
+        )
+    started = service.start(
+        db_path=db_file(g.data.root),
+        cache_path=screener_cache_path(g.data.root),
+        data=data,
+    )
+    if not started:
+        raise ApiError(409, "ScanInProgress", "a scan is already running — check its status")
+    return jsonify({"started": True, "status": service.snapshot()}), 202
+
+
+@bp.get("/screener/status")
+@require_auth
+def screener_status():
+    """Live progress of the current/last scan (for the progress bar)."""
+    return jsonify(current_app.config["SCREENER_SERVICE"].snapshot())
 
 
 # --- single-symbol quote (used by the trade form's market-price prefill) ----

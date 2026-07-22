@@ -88,6 +88,7 @@ export const api = {
   getStrategy: (name) => request(`/strategies/${enc(name)}`),
   createStrategy: (name, starting_cash) =>
     request("/strategies", { method: "POST", body: JSON.stringify({ name, starting_cash }) }),
+  deleteStrategy: (name) => request(`/strategies/${enc(name)}`, { method: "DELETE" }),
 
   // trading
   buy: (name, payload) =>
@@ -131,4 +132,9 @@ export const api = {
   priceSources: () => request("/prices/sources"),
   priceHistory: (symbol, period = "1mo", interval = "1d") =>
     request(`/prices/${enc(symbol)}/history?period=${enc(period)}&interval=${enc(interval)}`),
+
+  // screener (whole-market daily movers)
+  screener: () => request("/screener"),
+  scanScreener: () => request("/screener/scan", { method: "POST" }),
+  screenerStatus: () => request("/screener/status"),
 };

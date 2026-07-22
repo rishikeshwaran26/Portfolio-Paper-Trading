@@ -24,6 +24,7 @@ export default function Layout({ children, user, onLogout }) {
         <nav>
           <NavLink to="/" end>Dashboard</NavLink>
           <NavLink to="/watchlist">Watchlist</NavLink>
+          <NavLink to="/screener">Screener</NavLink>
           <NavLink to="/leaderboard">Leaderboard</NavLink>
           <NavLink to="/compare">Compare</NavLink>
           <NavLink to="/alerts">Alerts</NavLink>
