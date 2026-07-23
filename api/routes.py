@@ -29,11 +29,13 @@ multi-user a data change rather than a rewrite.
 from __future__ import annotations
 
 import os
+from datetime import date
 
 from flask import Blueprint, current_app, g, jsonify, request
 
 from engine import symbols
 from engine.alerts import ABOVE, BELOW
+from engine.backtest import DEFAULT_THRESHOLD_PCT, DEFAULT_WINDOW_DAYS
 from engine.prices import NsePythonPriceSource, market_is_open
 from engine.journal import (
     performance_by_confidence,
@@ -43,7 +45,7 @@ from engine.journal import (
 )
 from engine.manager import DEFAULT_STARTING_CASH
 from engine.portfolio import Portfolio
-from engine.repository import ScreenerRepository
+from engine.repository import BacktestRepository, ScreenerRepository
 from engine.screener import BRACKETS
 
 from .auth import require_auth
@@ -576,6 +578,80 @@ def start_screener_scan():
 def screener_status():
     """Live progress of the current/last scan (for the progress bar)."""
     return jsonify(current_app.config["SCREENER_SERVICE"].snapshot())
+
+
+# --- backtest (does the mean-reversion idea actually hold up historically?) --
+# Same GLOBAL-market-data reasoning as the screener section above: a backtest of
+# a given past date is the same for every user, so it's shared, not per-user.
+def _backtest_repo() -> BacktestRepository:
+    return BacktestRepository(db_file(g.data.root))
+
+
+@bp.post("/backtest/run")
+@require_auth
+def start_backtest():
+    """Replay a past date's whole-market movers in the background. Returns 202
+    with the initial status; the client then polls GET /backtest/status."""
+    body = json_body()
+    date_str = req_str(body, "target_date")
+    try:
+        target_date = date.fromisoformat(date_str)
+    except ValueError:
+        raise ApiError(400, "BadRequest", "'target_date' must be an ISO date, e.g. '2026-03-01'")
+    if target_date >= date.today():
+        raise ApiError(400, "BadRequest", "'target_date' must be in the past — there's nothing to replay yet")
+
+    direction = opt_str(body, "direction", "up")
+    if direction not in ("up", "down"):
+        raise ApiError(400, "BadRequest", "'direction' must be 'up' or 'down'")
+    threshold_pct = float(body.get("threshold_pct", DEFAULT_THRESHOLD_PCT))
+    window_days = int(body.get("window_days", DEFAULT_WINDOW_DAYS))
+    if not (1 <= window_days <= 90):
+        raise ApiError(400, "BadRequest", "'window_days' must be between 1 and 90")
+
+    service = current_app.config["BACKTEST_SERVICE"]
+    data = current_app.config.get("BACKTEST_DATA")
+    if data is None:
+        raise ApiError(
+            503, "BacktestUnavailable",
+            "the backtest needs a market data source; it's disabled in manual/offline mode",
+        )
+    started = service.start(
+        db_path=db_file(g.data.root),
+        cache_path=screener_cache_path(g.data.root),  # same NSE universe cache the screener uses
+        data=data,
+        target_date=target_date,
+        direction=direction,
+        threshold_pct=threshold_pct,
+        window_days=window_days,
+    )
+    if not started:
+        raise ApiError(409, "RunInProgress", "a backtest is already running — check its status")
+    return jsonify({"started": True, "status": service.snapshot()}), 202
+
+
+@bp.get("/backtest/status")
+@require_auth
+def backtest_status():
+    """Live progress of the current/last backtest (for the progress bar)."""
+    return jsonify(current_app.config["BACKTEST_SERVICE"].snapshot())
+
+
+@bp.get("/backtest/runs")
+@require_auth
+def list_backtest_runs():
+    """Every backtest run so far (any status), newest first — a history list
+    to revisit past results without re-running them."""
+    return jsonify({"runs": _backtest_repo().list_runs()})
+
+
+@bp.get("/backtest/runs/<int:run_id>")
+@require_auth
+def get_backtest_run(run_id: int):
+    detail = _backtest_repo().get_run(run_id)
+    if detail is None:
+        raise ApiError(404, "NotFound", f"no backtest run with id {run_id}")
+    return jsonify(detail)
 
 
 # --- single-symbol quote (used by the trade form's market-price prefill) ----

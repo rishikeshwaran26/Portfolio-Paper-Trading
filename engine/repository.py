@@ -792,3 +792,108 @@ class ScreenerRepository:
             "buckets": buckets,
             "movers": flat,
         }
+
+
+# --- backtest ------------------------------------------------------------------
+class BacktestRepository:
+    """Persistence for backtest runs — replaying a past date's movers and what
+    happened afterward. Not user-scoped, same reasoning as ScreenerRepository:
+    a backtest of March 1st gives the same answer for every user, so it's
+    written once and shared."""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+
+    def create_run(self, target_date: str, direction: str, threshold_pct: float, window_days: int) -> int:
+        with transaction(self.db_path) as conn:
+            cur = conn.execute(
+                """INSERT INTO backtest_runs
+                   (target_date, direction, threshold_pct, window_days, started_at, status)
+                   VALUES (?, ?, ?, ?, ?, 'running')""",
+                (target_date, direction, threshold_pct, window_days, _now()),
+            )
+            return cur.lastrowid
+
+    def finish_run(self, run_id: int, result) -> None:
+        """`result` is a backtest.BacktestResult. Writes every mover plus the
+        aggregate summary onto the run row, in one transaction."""
+        summary = result.summary()
+        with transaction(self.db_path) as conn:
+            conn.executemany(
+                """INSERT OR REPLACE INTO backtest_movers
+                   (run_id, symbol, name, direction, spike_pct, price_at_spike, prev_close,
+                    volume, avg_volume, vol_ratio, rsi, peak_price, peak_offset_days,
+                    first_red_offset_days, round_trip_offset_days, reverted, spark)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    (
+                        run_id, m.symbol, m.name, m.direction, m.spike_pct, m.price_at_spike,
+                        m.prev_close, m.volume, m.avg_volume, m.vol_ratio, m.rsi, m.peak_price,
+                        m.peak_offset_days, m.first_red_offset_days, m.round_trip_offset_days,
+                        1 if m.reverted else 0, json.dumps(m.spark),
+                    )
+                    for m in result.movers
+                ],
+            )
+            conn.execute(
+                """UPDATE backtest_runs
+                   SET status='done', finished_at=?, universe_count=?, mover_count=?,
+                       reverted_count=?, reverted_pct=?
+                   WHERE id=?""",
+                (
+                    _now(), result.universe_count, summary.mover_count,
+                    summary.reverted_count, summary.reverted_pct, run_id,
+                ),
+            )
+
+    def fail_run(self, run_id: int, error: str) -> None:
+        with transaction(self.db_path) as conn:
+            conn.execute(
+                "UPDATE backtest_runs SET status='error', finished_at=?, error=? WHERE id=?",
+                (_now(), error[:500], run_id),
+            )
+
+    def get_run(self, run_id: int) -> Optional[dict]:
+        with transaction(self.db_path) as conn:
+            run = conn.execute("SELECT * FROM backtest_runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                return None
+            movers = conn.execute(
+                "SELECT * FROM backtest_movers WHERE run_id=? ORDER BY ABS(spike_pct) DESC",
+                (run_id,),
+            ).fetchall()
+        return self._shape(run, movers)
+
+    def list_runs(self, limit: int = 20) -> list[dict]:
+        """Most recent runs of ANY status, newest first — for a history list."""
+        with transaction(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM backtest_runs ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [self._run_summary(r) for r in rows]
+
+    @staticmethod
+    def _run_summary(run) -> dict:
+        return {
+            "id": run["id"],
+            "target_date": run["target_date"],
+            "direction": run["direction"],
+            "threshold_pct": run["threshold_pct"],
+            "window_days": run["window_days"],
+            "status": run["status"],
+            "started_at": run["started_at"],
+            "finished_at": run["finished_at"],
+            "universe_count": run["universe_count"],
+            "mover_count": run["mover_count"],
+            "reverted_count": run["reverted_count"],
+            "reverted_pct": run["reverted_pct"],
+            "error": run["error"],
+        }
+
+    @classmethod
+    def _shape(cls, run, mover_rows) -> dict:
+        movers = [
+            dict(r) | {"reverted": bool(r["reverted"]), "spark": json.loads(r["spark"] or "[]")}
+            for r in mover_rows
+        ]
+        return {"run": cls._run_summary(run), "movers": movers}

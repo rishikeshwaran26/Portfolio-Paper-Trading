@@ -1,17 +1,14 @@
 import { useEffect, useState } from "react";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import Layout from "./components/Layout.jsx";
-import AlertBanner from "./components/AlertBanner.jsx";
 import { Loading } from "./components/Status.jsx";
 import DashboardPage from "./pages/DashboardPage.jsx";
 import StrategyDetailPage from "./pages/StrategyDetailPage.jsx";
 import JournalPage from "./pages/JournalPage.jsx";
 import AnalyticsPage from "./pages/AnalyticsPage.jsx";
-import LeaderboardPage from "./pages/LeaderboardPage.jsx";
-import ComparePage from "./pages/ComparePage.jsx";
-import AlertsPage from "./pages/AlertsPage.jsx";
 import WatchlistPage from "./pages/WatchlistPage.jsx";
 import ScreenerPage from "./pages/ScreenerPage.jsx";
+import BacktestPage from "./pages/BacktestPage.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
 import { api } from "./api.js";
 import { getToken, clearToken } from "./auth.js";
@@ -56,17 +53,14 @@ export default function App() {
   return (
     <BrowserRouter>
       <Layout user={user} onLogout={logout}>
-        <AlertBanner />
         <Routes>
           <Route path="/" element={<DashboardPage />} />
           <Route path="/strategies/:name" element={<StrategyDetailPage />} />
           <Route path="/strategies/:name/journal" element={<JournalPage />} />
           <Route path="/strategies/:name/analytics" element={<AnalyticsPage />} />
-          <Route path="/leaderboard" element={<LeaderboardPage />} />
           <Route path="/watchlist" element={<WatchlistPage />} />
           <Route path="/screener" element={<ScreenerPage />} />
-          <Route path="/compare" element={<ComparePage />} />
-          <Route path="/alerts" element={<AlertsPage />} />
+          <Route path="/backtest" element={<BacktestPage />} />
         </Routes>
       </Layout>
     </BrowserRouter>

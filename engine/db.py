@@ -214,6 +214,50 @@ CREATE TABLE IF NOT EXISTS screener_movers (
     PRIMARY KEY (run_id, symbol)
 );
 CREATE INDEX IF NOT EXISTS idx_screener_movers_run ON screener_movers(run_id);
+
+-- Backtest runs: replay a PAST date's whole-market movers and measure what
+-- happened afterward, using history that already exists — unlike screener_runs
+-- (today's live scan), a backtest_run can be re-created any time since it only
+-- reads historical prices. Shared market data, not user-scoped, same as prices
+-- and screener_runs.
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_date    TEXT NOT NULL,            -- YYYY-MM-DD being replayed
+    direction      TEXT NOT NULL,            -- up | down
+    threshold_pct  REAL NOT NULL,
+    window_days    INTEGER NOT NULL,
+    started_at     TEXT NOT NULL,
+    finished_at    TEXT,
+    status         TEXT NOT NULL,            -- running | done | error
+    universe_count INTEGER NOT NULL DEFAULT 0,
+    mover_count    INTEGER NOT NULL DEFAULT 0,
+    reverted_count INTEGER NOT NULL DEFAULT 0,
+    reverted_pct   REAL,
+    error          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_date ON backtest_runs(target_date);
+
+CREATE TABLE IF NOT EXISTS backtest_movers (
+    run_id                 INTEGER NOT NULL REFERENCES backtest_runs(id) ON DELETE CASCADE,
+    symbol                 TEXT    NOT NULL,
+    name                   TEXT    NOT NULL DEFAULT '',
+    direction              TEXT    NOT NULL,
+    spike_pct              REAL    NOT NULL,
+    price_at_spike         REAL    NOT NULL,
+    prev_close             REAL    NOT NULL,
+    volume                 INTEGER NOT NULL DEFAULT 0,
+    avg_volume             INTEGER NOT NULL DEFAULT 0,
+    vol_ratio              REAL    NOT NULL DEFAULT 0,
+    rsi                    REAL,
+    peak_price             REAL    NOT NULL,
+    peak_offset_days       INTEGER NOT NULL DEFAULT 0,
+    first_red_offset_days  INTEGER,
+    round_trip_offset_days INTEGER,
+    reverted               INTEGER NOT NULL DEFAULT 0,
+    spark                  TEXT    NOT NULL DEFAULT '[]',  -- JSON list of closes for a mini chart
+    PRIMARY KEY (run_id, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_movers_run ON backtest_movers(run_id);
 """
 
 # Columns added to screener_movers after its first release. init_db ALTERs them
@@ -227,6 +271,11 @@ _SCREENER_MOVER_ADDED_COLUMNS = [
     ("spark", "TEXT NOT NULL DEFAULT '[]'"),
     ("results_recent", "INTEGER NOT NULL DEFAULT 0"),
     ("results_date", "TEXT"),
+]
+
+# Same idea for backtest_movers: columns added after its first release.
+_BACKTEST_MOVER_ADDED_COLUMNS = [
+    ("spark", "TEXT NOT NULL DEFAULT '[]'"),
 ]
 
 
@@ -279,19 +328,21 @@ def init_db(db_path: str) -> None:
                 (str(SCHEMA_VERSION),),
             )
         _migrate_legacy_watchlist(conn)
-        _migrate_screener_columns(conn)
+        _migrate_added_columns(conn, "screener_movers", _SCREENER_MOVER_ADDED_COLUMNS)
+        _migrate_added_columns(conn, "backtest_movers", _BACKTEST_MOVER_ADDED_COLUMNS)
 
 
-def _migrate_screener_columns(conn: sqlite3.Connection) -> None:
-    """Add later screener_movers columns to a pre-existing database. Idempotent:
-    checks the current columns first and only ALTERs in the missing ones, so
-    it's a no-op on every startup after the first."""
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(screener_movers)")}
+def _migrate_added_columns(conn: sqlite3.Connection, table: str, added: list[tuple[str, str]]) -> None:
+    """Add columns introduced after a table's first release to a pre-existing
+    database (SQLite has no "ADD COLUMN IF NOT EXISTS"). Idempotent: checks the
+    current columns first and only ALTERs in the missing ones, so it's a no-op
+    on every startup after the first."""
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if not existing:
         return  # table not created yet (fresh DB just built it with all columns)
-    for name, decl in _SCREENER_MOVER_ADDED_COLUMNS:
+    for name, decl in added:
         if name not in existing:
-            conn.execute(f"ALTER TABLE screener_movers ADD COLUMN {name} {decl}")
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def _migrate_legacy_watchlist(conn: sqlite3.Connection) -> None:

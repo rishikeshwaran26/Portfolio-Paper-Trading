@@ -137,4 +137,10 @@ export const api = {
   screener: () => request("/screener"),
   scanScreener: () => request("/screener/scan", { method: "POST" }),
   screenerStatus: () => request("/screener/status"),
+
+  // backtest (did a past spike actually revert?)
+  runBacktest: (payload) => request("/backtest/run", { method: "POST", body: JSON.stringify(payload) }),
+  backtestStatus: () => request("/backtest/status"),
+  listBacktestRuns: () => request("/backtest/runs"),
+  getBacktestRun: (id) => request(`/backtest/runs/${enc(id)}`),
 };

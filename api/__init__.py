@@ -20,6 +20,7 @@ import os
 from flask import Flask, jsonify
 from flask_cors import CORS
 
+from engine.backtest import YFinanceBacktestData
 from engine.db import init_db
 from engine.prices import build_source
 from engine.screener import YFinanceScreenerData
@@ -27,6 +28,7 @@ from engine.screener import YFinanceScreenerData
 from .auth import load_or_create_secret
 from .paths import db_file
 from .auth_routes import auth_bp
+from .backtest_service import BacktestService
 from .errors import register_error_handlers
 from .jobs import BackgroundWorker, should_start_worker
 from .routes import bp, screener_cache_path
@@ -76,6 +78,11 @@ def create_app(
     # inject a fake provider into SCREENER_DATA when they want to exercise a scan.
     app.config["SCREENER_SERVICE"] = ScreenerService()
     app.config["SCREENER_DATA"] = None if mode == "manual" else YFinanceScreenerData()
+
+    # Backtest: same async-service pattern as the screener, its own market-data
+    # provider (historical bars over an arbitrary date range, not "recent").
+    app.config["BACKTEST_SERVICE"] = BacktestService()
+    app.config["BACKTEST_DATA"] = None if mode == "manual" else YFinanceBacktestData()
 
     # Signing key for auth tokens. Persisted so a restart doesn't log you out.
     app.config["SECRET_KEY"] = load_or_create_secret(data_root)
@@ -149,6 +156,10 @@ def create_app(
                     "GET    /screener",
                     "POST   /screener/scan",
                     "GET    /screener/status",
+                    "POST   /backtest/run",
+                    "GET    /backtest/status",
+                    "GET    /backtest/runs",
+                    "GET    /backtest/runs/<id>",
                 ],
             }
         )
