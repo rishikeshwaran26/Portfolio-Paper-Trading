@@ -359,14 +359,23 @@ def _enrich(
 def _is_recent(date_str: str, days: int = 4) -> bool:
     """True if an ISO date is within the last `days` days — for the 'Results
     recently' tag. A result out in the last few sessions is a plausible cause of
-    a big move."""
-    from datetime import datetime, timezone
+    a big move.
+
+    Compared as plain calendar dates, not timestamps: an earnings date is a
+    day, not an instant, so there is no "timezone" for it to be in. Mixing it
+    with a UTC-aware `now` would make the comparison flip depending on the time
+    of day and the server's local offset — e.g. IST is UTC+5:30, so for the
+    ~5.5 hours after UTC midnight, `date.today()` in India is already
+    "tomorrow" relative to UTC, which would make a same-day result look 1 day
+    in the future and fail the `>= 0` check below.
+    """
+    from datetime import date
 
     try:
-        d = datetime.fromisoformat(date_str[:10]).replace(tzinfo=timezone.utc)
+        d = date.fromisoformat(date_str[:10])
     except (ValueError, TypeError):
         return False
-    return 0 <= (datetime.now(timezone.utc) - d).days <= days
+    return 0 <= (date.today() - d).days <= days
 
 
 def _reasons_for(m: Mover) -> list[str]:
